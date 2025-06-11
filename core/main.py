@@ -15,7 +15,10 @@ from data import collate_fn, CorrespondencesDataset
 # from oan import CLNet as Model
 #from CLNet_restormer import CLNet as Model
 #from clnet_hgnn import CLNet as Model
-from CGRNet import CGRNet as Model
+#from clnet import CLNet as Model
+#from icml import CLNet as Model
+from icml11 import CLNet as Model
+#from ncmnet import NCMNet as Model
 #from stable_gcn_oa_att_resformer import CLNet as Model
 from train import train
 from test import test
@@ -50,7 +53,7 @@ def main(config):
 
     model = Model(config)
     model = model.cuda()
-
+    print('generated parameters:', sum(param.numel() for param in model.parameters()))
 
 
     # Run propper mode

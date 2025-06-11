@@ -54,13 +54,13 @@ net_arg.add_argument(
 # Data
 data_arg = add_argument_group("Data")
 data_arg.add_argument(
-    "--data_tr", type=str, default='/DATASET/SIFT/yfcc-sift-2000-train.hdf5', help=""
+    "--data_tr", type=str, default='/home/web603/code/data_dump/yfcc100m/yfcc-sift-2000-train.hdf5', help=""
     "name of the dataset for train")
 data_arg.add_argument(
-    "--data_va", type=str, default='/DATASET/SIFT/yfcc-sift-2000-val.hdf5', help=""
+    "--data_va", type=str, default='/home/web603/code/data_dump/yfcc100m/yfcc-sift-2000-val.hdf5', help=""
     "name of the dataset for valid")
 data_arg.add_argument(
-    "--data_te", type=str, default='/DATASET/SIFT/yfcc-sift-2000-test.hdf5', help=""
+    "--data_te", type=str, default='/home/web603/code/data_dump/yfcc100m/yfcc-sift-2000-test.hdf5', help=""
     "name of the unseen dataset for test")
 
 
@@ -147,7 +147,7 @@ test_arg.add_argument(
     "--use_ransac", type=str2bool, default=False, help=""
     "use ransac when testing?")
 test_arg.add_argument(
-    "--model_path", type=str, default="/home/lab603/Documents/lxj/CLNet/CLNet_lxj/log/train/", help=""
+    "--model_path", type=str, default="/home/web603/code/CGR-Net/log/train/", help=""
     "saved best model path for test.   ../log/train")
 test_arg.add_argument(
     "--res_path", type=str, default="", help=""
