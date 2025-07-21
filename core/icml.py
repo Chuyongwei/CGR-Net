@@ -2,6 +2,18 @@ import torch
 import torch.nn as nn
 from loss import batch_episym
 
+'''
+@Title: icml
+@Author: ChuyongWei
+@Date: 2025-07-21
+@Version: 1.0
+@Description:
+这是我们baseline
+
+
+'''
+
+
 # 维度转换
 class trans(nn.Module):
     def __init__(self, dim1, dim2):

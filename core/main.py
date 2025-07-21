@@ -2,6 +2,8 @@
 # Author: Jiahui Zhang
 # Date: 2019/09/03
 # E-mail: jiahui-z15@mails.tsinghua.edu.cn
+import shutil
+
 from thop import profile
 
 from config import get_config, print_usage
@@ -15,7 +17,8 @@ from data import collate_fn, CorrespondencesDataset
 # from oan import CLNet as Model
 #from CLNet_restormer import CLNet as Model
 #from clnet_hgnn import CLNet as Model
-from CGRNet import CGRNet as Model
+# from CGRNet import CGRNet as Model
+from icml import CLNet as Model
 #from stable_gcn_oa_att_resformer import CLNet as Model
 from train import train
 from test import test
