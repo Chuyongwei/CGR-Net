@@ -315,15 +315,29 @@ class GCN_Block(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    # NOTE 激活并且切换
+    # NOTE 双曲正切激活并且内积和将信息聚合到一起
     def attention(self, w):
+        # BN
         # 双曲正切然后最后一排加空间
+        # BN1
         w = torch.relu(torch.tanh(w)).unsqueeze(-1) #w[32,2000,1] 变成0到1的权重
         # wT x w
-        A = torch.bmm(w.transpose(1, 2), w) #A[32,1,1]
+        # B1N x BN1 ->B11
+        # 特征内积和聚合到一个数值
+        # NOTE
+        A = torch.bmm(w.transpose(1, 2), w ) #A[32,1,1]
         return A
 
-    # x与w的结合
+    '''
+    x与w的结合
+    w处理
+    + A：w双曲正切内积和
+    + A+I求每行的和取倒数然后开方换成对角矩阵得D
+    + L = DAD (BNN)
+    结合
+    + x(BCN1)->BNC
+    + out=L(BNN)@X(BNC)->BNC->BCN1
+    '''
     def graph_aggregation(self, x, w):
         B, _, N, _ = x.size() #B=32,N=2000
         # 全局上下文嵌入fg = ()
@@ -343,14 +357,18 @@ class GCN_Block(nn.Module):
         # 交换成 BCNW->BNCW 每个单体的层次为单位计算
         # contiguous:确保矩阵在连续物理单元中
         out = x.squeeze(-1).transpose(1, 2).contiguous() #out[32,2000,128]
+        # L(BNN) @ X(BNC)->BNC->BNC1
         out = torch.bmm(L, out).unsqueeze(-1)
+        # BCN1
         out = out.transpose(1, 2).contiguous() #out[32,128,2000,1]
 
         return out
 
     def forward(self, x, w):
         #x[32,128,2000,1],w[32,2000]
+        # NOTE 将我们处理后得特征点和权重进行结合
         out = self.graph_aggregation(x, w)
+        # 卷积
         out = self.conv(out)
         return out
 

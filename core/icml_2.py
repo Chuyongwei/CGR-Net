@@ -3,7 +3,7 @@ import torch.nn as nn
 from loss import batch_episym
 
 '''
-@Title: icml
+@Title: icml_2
 @Author: ChuyongWei
 @Date: 2025-08-5
 @Version: 1.0
@@ -11,8 +11,7 @@ from loss import batch_episym
 这是我们baseline
 原来的版本是把所有的点做个平方相加，我感觉比较单调,不如以前的版本
 
-修改一下gcn改为原来的版本，就是计算每一个点之间的关系
-
+修改一下gcn改为原来的版本，就是计算每一个点之间的关系,对于后面的东西的话
 
 '''
 
@@ -329,7 +328,16 @@ class GCN_Block(nn.Module):
         A = torch.bmm( w,w.transpose(1, 2)) #A[32,1,1]
         return A
 
-    # x与w的结合
+    '''
+    x与w的结合
+    w处理
+    + A：w双曲正切内积和
+    + A+I求每行的和取倒数然后开方换成对角矩阵得D
+    + L = DAD (BNN)
+    结合
+    + x(BCN1)->BNC
+    + out=L(BNN)@X(BNC)->BNC->BCN1
+    '''
     def graph_aggregation(self, x, w):
         B, _, N, _ = x.size() #B=32,N=2000
         # 全局上下文嵌入fg = ()
