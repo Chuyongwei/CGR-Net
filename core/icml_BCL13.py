@@ -561,6 +561,7 @@ class DS_Block(nn.Module):
         # XXX 这边可以考虑加入我们的学习率
         # BCRBlock(out_channel, self.k_num, self.sr)
         self.bcr = BCRBlock(out_channel, self.k_num)
+        self.bcr2 = BCRBlock(out_channel, self.k_num)
 
         # gcn 入口为out_channel
         self.gcn = GCN_Block(self.out_channel)
@@ -640,6 +641,7 @@ class DS_Block(nn.Module):
         # 将簇级和全局的相加
         out = out_g + out
 
+        out = self.bcr2(torch.cat([out, out_g], dim=1))
         out = self.embed_1(out)  # CGCE+NGCE=ResNet * 2 + OABlock + ResNet * 2 + DGCNN_MAX + ResNet * 2
         w1 = self.linear_1(out).view(B, -1)  # w1[32,2000]
         # TAG 结束
