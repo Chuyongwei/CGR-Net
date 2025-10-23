@@ -54,7 +54,7 @@ def main(config):
     model = Model(config)
     model = model.cuda()
 
-
+    print('generated parameters:', sum(param.numel() for param in model.parameters()))
 
     # Run propper mode
     if config.run_mode == "train":
