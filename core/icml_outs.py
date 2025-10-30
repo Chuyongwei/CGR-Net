@@ -488,7 +488,7 @@ class DS_Block(nn.Module):
             w1_ds, indices = torch.sort(w1, dim=-1, descending=True) #w1排序,w1_ds[32,2000],indices[32,2000]是索引
             w1_ds = w1_ds[:, :int(N*self.sr)] #w1_ds[32,1000]剪枝？剪掉一半 self.sr=0.5
             x_ds, y_ds, w0_ds, outs_p = self.down_sampling(x, y, w0, indices, outs,None, self.predict)
-            print(outs_p[0].shape)
+            # print(outs_p[0].shape)
             #x_ds[32,1,1000,4],y_ds[32,1000],w0_ds[32,1000],ds：剪枝后？
             return x_ds, y_ds, [w0, w1], [w0_ds, w1_ds],outs_p
         else: #剪枝，出预测结果
