@@ -456,13 +456,17 @@ class DS_Block(nn.Module):
             feature_out = torch.gather(features, dim=2, index=indices.repeat(1, 128, 1, 1)) #feature_out 剪枝后保留的features[32,128,500,1]
             return x_out, y_out, w_out, feature_out
 
-    def forward(self, x, y,outs=None):
+    def forward(self, x, y,outs_p=None):
         # x[32,1,2000,4],y[32,2000]
         # x_[32,1,1000,6],y1[32,1000]
         outs = []
         B, _, N , _ = x.size()
         out = x.transpose(1, 3).contiguous() #contiguous断开out与x的依赖关系。out[32,4或6,2000,1]
         out = self.conv(out) #out[32,128,2000,1]
+
+        if outs_p is not None:
+            pass
+
 
         # TAG 开始
         ## NOTE 局部领域上下图+ 簇级图上下文
