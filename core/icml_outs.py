@@ -444,7 +444,8 @@ class DS_Block(nn.Module):
             with torch.no_grad():
                 # out(BCN1)
                 for out in outs:
-                    indices1 = indices.expand(-1, out.size(1), -1, -1)
+                    # indices1 = indices.expend(-1, out.size(1), -1, -1)
+                    indices1 = indices.repeat(1, out.size(1), 1, 1)
                     out = torch.gather(out, dim=2, index=indices1)  # x_out [32, 1, M, 4]
                     outs_p.append(out)
             with torch.no_grad():
