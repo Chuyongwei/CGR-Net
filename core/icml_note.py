@@ -1,19 +1,18 @@
 import torch
 import torch.nn as nn
 from loss import batch_episym
-from einops import rearrange
 
 '''
-@Title BCL
-@Author ChuyongWei
-@Date 2025/07/18
-@Description
-基本构型
-将BCMA替换原来的DGCNN_MAX_Block
-@Evaluation
-baseline：map 68.04
-感觉可能效果一般
+@Title: icml
+@Author: ChuyongWei
+@Date: 2025-07-21
+@Version: 1.0
+@Description:
+这是我们baseline
+笔记
+
 '''
+
 
 # 维度转换
 class trans(nn.Module):
@@ -144,22 +143,58 @@ class OABlock(nn.Module):
         out = torch.cat([x1_1, x_up], dim=1)
         return self.shot_cut(out)
 
+class DSBlock(nn.Module):
+    def __init__(self, net_channels, clusters=256, knn_num=6):
+        nn.Module.__init__(self)
+        channels = net_channels
+        self.k_num = knn_num
+        l2_nums = clusters
+        self.down1 = diff_pool(channels, l2_nums)
+        self.up1 = diff_unpool(channels, l2_nums)
+        self.output = nn.Conv2d(channels, 1, kernel_size=1)
+        self.shot_cut = nn.Conv2d(channels * 2, channels, kernel_size=1)
+        self.DGCNN_MAX_Block = DGCNN_MAX_Block(self.k_num, l2_nums)
+
+    def forward(self, data):
+        # data: b*c*n*1
+
+        x1_1 = data
+        x_down = self.down1(x1_1).transpose(1,2)
+        x2 = self.DGCNN_MAX_Block(x_down).transpose(1,2)
+
+        x_up = self.up1(x1_1, x2)
+        out = torch.cat([x1_1, x_up], dim=1)
+        return self.shot_cut(out)
+
+# 获得k个邻近点的索引值
 def knn(x, k):
+    # x(BCN) k获取的邻近数量
+    # NOTE x内积*-2 ：不同邻居之间的针对C通道进行融合，B N(参考点) N（对照点）
+    # BNC@BCN -> BNN
     inner = -2*torch.matmul(x.transpose(2, 1), x) #inner[32,2000,2000]内积？
+    # NOTE 这边是计算每个点的总特征值
+    # sum: x^2C通道上求和
     xx = torch.sum(x**2, dim=1, keepdim=True) #xx[32,1,2000]
+    # NOTE 关于sum的两个矩阵，我的理解是给inner矩阵减去参考点和对照点的总特征值（我们计算的是他们相对的值，不能有基础分数）
+    # -sum+2*inner-sum.T
     pairwise_distance = -xx - inner - xx.transpose(2, 1) #distance[32,2000,2000]****记得回头看
 
+    # 对每个点，选择距离最小的 k 个点，返回它们的索引。结果是 [batch_size, num_points, k]
     idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k) [32,2000,9] [32,1000,6]
 
     return idx[:, :, :]
 
 # NOTE 获取图像的特征点
+#  x2：x与k个临近点之间所有C通道的差值
+#  获得x和x2的结合
 def get_graph_feature(x, k=20, idx=None):
     #x[32,128,2000,1],k=9
     # x[32,128,1000,1],k=6
     batch_size = x.size(0)
     num_points = x.size(2)
+    # 等同于squeeze(-1)
     x = x.view(batch_size, -1, num_points) #x[32,128,2000]
+    # 是否有准备进行处理的参考值
     if idx is None:
         idx_out = knn(x, k=k) #idx_out[32,2000,9]
     else:
@@ -167,18 +202,24 @@ def get_graph_feature(x, k=20, idx=None):
 
     device = x.device
 
+    #NOTE  按批次为顺序标记序号
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
 
     idx = idx_out + idx_base #idx[32,2000,9] 把32个批次的标号连续了
 
     idx = idx.view(-1) #idx[32*2000*9] 把32个批次连在一起了 [32*1000*6]
-
+    # B C N
     _, num_dims, _ = x.size()
 
+    # NOTE 针对我们选取的索引进行筛选
     x = x.transpose(2, 1).contiguous() #x[32,2000,128]
-    feature = x.view(batch_size*num_points, -1)[idx, :]
-    feature = feature.view(batch_size, num_points, k, num_dims) #feature[32,2000,9,128]
+    # 选取我们上个步骤筛选的邻近k点
+    feature = x.view(batch_size*num_points, -1)[idx, :]# (B*N,C).(BNK)-->(BNK,C)
+    feature = feature.view(batch_size, num_points, k, num_dims) #feature[32,2000,9,128] BNKC
+    # 把x的通道位复制k份
+    # BNC1 -->BN1C -->BNKC
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1) #x[32,2000,9,128]
+    # 把x和 x-feature做拼接（B N 2K C） --> B C N 2K
     feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous() #feature[32,256,2000,9] 图特征
     return feature
 
@@ -250,116 +291,36 @@ def weighted_8points(x_in, logits):
     return e_hat
 
 
-class DGCNN_Layer(nn.Module):
-    def __init__(self, knn_num=10, in_channel=128):
-        super(DGCNN_Layer, self).__init__()
+class DGCNN_MAX_Block(nn.Module):
+    def __init__(self, knn_num=9, in_channel=128):
+        super(DGCNN_MAX_Block, self).__init__()
+        # k邻居块
         self.knn_num = knn_num
         self.in_channel = in_channel
 
-        assert self.knn_num == 9 or self.knn_num == 6
-        if self.knn_num == 9:
-            self.conv = nn.Sequential(
-                nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 3), stride=(1, 3)),
-                # [32,128,2000,9]→[32,128,2000,3]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),  # [32,128,2000,3]→[32,128,2000,1]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True),
-            )
-        if self.knn_num == 6:
-            self.conv = nn.Sequential(
-                nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 3), stride=(1, 3)),
-                # [32,128,2000,6]→[32,128,2000,2]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.in_channel, self.in_channel, (1, 2)),  # [32,128,2000,2]→[32,128,2000,1]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True)
+        self.conv = nn.Sequential(
+            nn.Conv2d(self.in_channel*2, self.in_channel, (1, 1)), #[32,128,2000,9]→[32,128,2000,3]
+            nn.BatchNorm2d(self.in_channel),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.in_channel, self.in_channel, (1, 1)), #[32,128,2000,3]→[32,128,2000,1]
+            nn.BatchNorm2d(self.in_channel),
+            nn.ReLU(inplace=True),
             )
 
-    def forward(self, x):
-        # print(self.knn_num)
-        out = self.conv(x)  # BCN1
+    def forward(self, features):
+        #feature[32,128,2000,1]
+        B, _, N, _ = features.shape
+        # 获取高维特征映射结构为KxK，我们来制作knn块
+        out = get_graph_feature(features, k=self.knn_num)
+        # 卷积
+        out = self.conv(out) #out[32,128,2000,1]
+        # 获取最大值
+        # [32,128,2000]
+        out = out.max(dim=-1, keepdim=False)[0]
+        # 解压
+        out = out.unsqueeze(3)
         return out
 
-class BCMAttention(nn.Module):
-    def __init__(self, channels, num_heads, k_num=20):
-        super(BCMAttention, self).__init__()
-        self.k_num = k_num
-        self.num_heads = num_heads
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))  # h11
-
-        self.query_filter = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=(1, 1)),
-            nn.InstanceNorm2d(channels, eps=1e-3),
-            nn.BatchNorm2d(channels),
-            nn.ReLU())
-        self.key_filter = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=(1, 1)),
-            nn.InstanceNorm2d(channels, eps=1e-3),
-            nn.BatchNorm2d(channels),
-            nn.ReLU())
-        self.value_filter = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=(1, 1)),
-            nn.InstanceNorm2d(channels, eps=1e-3),
-            nn.BatchNorm2d(channels),
-            nn.ReLU())
-        self.gcn_q = DGCNN_Layer(knn_num=self.k_num, in_channel=channels)
-        self.gcn_k = DGCNN_Layer(knn_num=self.k_num, in_channel=channels)
-        self.gcn_v = DGCNN_Layer(knn_num=self.k_num, in_channel=channels)
-        self.project_out = nn.Conv2d(channels, channels, kernel_size=(1, 1))
-
-    def forward(self, x):
-        B, C, N, _ = x.shape
-        q = self.query_filter(x)
-        k = self.key_filter(x)
-        v = self.value_filter(x)
-
-        q = self.gcn_q(get_graph_feature(q, k=self.k_num))
-        k = self.gcn_k(get_graph_feature(k, k=self.k_num))
-        v = self.gcn_v(get_graph_feature(v, k=self.k_num))
-
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-
-        q = torch.nn.functional.normalize(q, dim=-1)
-        k = torch.nn.functional.normalize(k, dim=-1)
-
-        # softmax(q@k)v
-        attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v)
-
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=N, w=1)
-
-        out = self.project_out(out)
-        return out + x
-
-def to_3d(x):
-    return rearrange(x, 'b c h w -> b (h w) c')
-
-
-def to_4d(x, h, w):
-    return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
-
-class BCMA(nn.Module):
-    def __init__(self, channels, num_heads=4, k_num=8):
-        super(BCMA, self).__init__()
-        self.k_num = k_num
-        self.norm1 = nn.LayerNorm(channels)
-        self.attn = BCMAttention(channels, num_heads, self.k_num)
-        self.norm2 = nn.LayerNorm(channels)
-        self.ffn = ResNet_Block(channels, channels, pre=False)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        xs = to_4d(self.norm1(to_3d(x)), h, w)
-        x = x + self.attn(xs)
-        xs = to_4d(self.norm2(to_3d(x)), h, w)
-        x = x + self.ffn(xs)
-        return x  # BCN1
 
 # TAG GCN 权值结合，然后卷积
 class GCN_Block(nn.Module):
@@ -372,15 +333,29 @@ class GCN_Block(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    # NOTE 激活并且切换
+    # NOTE 双曲正切激活并且内积和将信息聚合到一起
     def attention(self, w):
+        # BN
         # 双曲正切然后最后一排加空间
+        # BN1
         w = torch.relu(torch.tanh(w)).unsqueeze(-1) #w[32,2000,1] 变成0到1的权重
         # wT x w
-        A = torch.bmm(w.transpose(1, 2), w) #A[32,1,1]
+        # B1N x BN1 ->B11
+        # 特征内积和聚合到一个数值
+        # NOTE
+        A = torch.bmm(w.transpose(1, 2), w ) #A[32,1,1]
         return A
 
-    # x与w的结合
+    '''
+    x与w的结合
+    w处理
+    + A：w双曲正切内积和
+    + A+I求每行的和取倒数然后开方换成对角矩阵得D
+    + L = DAD (BNN)
+    结合
+    + x(BCN1)->BNC
+    + out=L(BNN)@X(BNC)->BNC->BCN1
+    '''
     def graph_aggregation(self, x, w):
         B, _, N, _ = x.size() #B=32,N=2000
         # 全局上下文嵌入fg = ()
@@ -400,14 +375,18 @@ class GCN_Block(nn.Module):
         # 交换成 BCNW->BNCW 每个单体的层次为单位计算
         # contiguous:确保矩阵在连续物理单元中
         out = x.squeeze(-1).transpose(1, 2).contiguous() #out[32,2000,128]
+        # L(BNN) @ X(BNC)->BNC->BNC1
         out = torch.bmm(L, out).unsqueeze(-1)
+        # BCN1
         out = out.transpose(1, 2).contiguous() #out[32,128,2000,1]
 
         return out
 
     def forward(self, x, w):
         #x[32,128,2000,1],w[32,2000]
+        # NOTE 将我们处理后得特征点和权重进行结合
         out = self.graph_aggregation(x, w)
+        # 卷积
         out = self.conv(out)
         return out
 
@@ -434,9 +413,6 @@ class DS_Block(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        self.resfomer_1 = BCMA(self.out_channel, num_heads=4, k_num=self.k_num)
-        self.resfomer_2 = BCMA(self.out_channel, num_heads=4, k_num=self.k_num)
-
         # gcn 入口为out_channel
         self.gcn = GCN_Block(self.out_channel)
 
@@ -445,8 +421,8 @@ class DS_Block(nn.Module):
         self.embed_0 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            # FIX 替换掉
-            BCMA(self.out_channel, num_heads=4, k_num=self.k_num),
+            # NGCE
+            DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             # CGCE
@@ -460,8 +436,7 @@ class DS_Block(nn.Module):
             OABlock(self.out_channel, clusters=128),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            # FIX 替换掉
-            BCMA(self.out_channel, num_heads=4, k_num=self.k_num),
+            DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
         )

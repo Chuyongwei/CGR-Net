@@ -1,7 +1,21 @@
 import torch
 import torch.nn as nn
 from loss import batch_episym
-#
+
+'''
+@Title: icml
+@Author: ChuyongWei
+@Date: 2025-07-21
+@Version: 1.0
+@Description:
+这是我们baseline
+
+@Evaluation
+评价
+'''
+
+
+# 维度转换
 class trans(nn.Module):
     def __init__(self, dim1, dim2):
         nn.Module.__init__(self)
@@ -11,6 +25,7 @@ class trans(nn.Module):
     def forward(self, x):
         return x.transpose(self.dim1, self.dim2)
 
+# TAG OA块
 class OAFilter(nn.Module):
     def __init__(self, channels, points, out_channels=None):
         nn.Module.__init__(self)
@@ -67,8 +82,12 @@ class diff_pool(nn.Module):
             nn.Conv2d(in_channel, output_points, kernel_size=1))
 
     def forward(self, x):
+        # 卷积 bcn1
         embed = self.conv(x)  # b*k*n*1
+        # 归一化 每个管道的值 bcn
         S = torch.softmax(embed, dim=2).squeeze(3)
+        # X x Softmax
+        # X(bcn) x bnc -> (bcc)->(bcc1)
         out = torch.matmul(x.squeeze(3), S.transpose(1, 2)).unsqueeze(3)
         return out
 
@@ -95,25 +114,33 @@ class OABlock(nn.Module):
     def __init__(self, net_channels, depth=6, clusters=250):
         nn.Module.__init__(self)
         channels = net_channels
+        # 层数
         self.layer_num = depth
+
+        # l2 OAFilter块
         l2_nums = clusters
         self.down1 = diff_pool(channels, l2_nums)
+        self.up1 = diff_unpool(channels, l2_nums)
         self.l2 = []
         for _ in range(self.layer_num // 2):
             self.l2.append(OAFilter(channels, l2_nums))
-        self.up1 = diff_unpool(channels, l2_nums)
         self.l2 = nn.Sequential(*self.l2)
+
         self.output = nn.Conv2d(channels, 1, kernel_size=1)
         self.shot_cut = nn.Conv2d(channels * 2, channels, kernel_size=1)
-        
+
 
     def forward(self, data):
         # data: b*c*n*1
 
         x1_1 = data
+        # 划分簇
         x_down = self.down1(x1_1)
+        # OA
         x2 = self.l2(x_down)
+        # 分解簇
         x_up = self.up1(x1_1, x2)
+
         out = torch.cat([x1_1, x_up], dim=1)
         return self.shot_cut(out)
 
@@ -150,6 +177,7 @@ def knn(x, k):
 
     return idx[:, :, :]
 
+# NOTE 获取图像的特征点
 def get_graph_feature(x, k=20, idx=None):
     #x[32,128,2000,1],k=9
     # x[32,128,1000,1],k=6
@@ -178,6 +206,7 @@ def get_graph_feature(x, k=20, idx=None):
     feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous() #feature[32,256,2000,9] 图特征
     return feature
 
+# NOTE 残差网络有助于解决梯度爆炸/消失的问题
 class ResNet_Block(nn.Module):
     def __init__(self, inchannel, outchannel, pre=False):
         super(ResNet_Block, self).__init__()
@@ -248,6 +277,7 @@ def weighted_8points(x_in, logits):
 class DGCNN_MAX_Block(nn.Module):
     def __init__(self, knn_num=9, in_channel=128):
         super(DGCNN_MAX_Block, self).__init__()
+        # k邻居块
         self.knn_num = knn_num
         self.in_channel = in_channel
 
@@ -263,13 +293,19 @@ class DGCNN_MAX_Block(nn.Module):
     def forward(self, features):
         #feature[32,128,2000,1]
         B, _, N, _ = features.shape
+        # 获取高维特征映射结构为KxK，我们来制作knn块
         out = get_graph_feature(features, k=self.knn_num)
+        # 卷积
         out = self.conv(out) #out[32,128,2000,1]
+        # 获取最大值
+        # [32,128,2000]
         out = out.max(dim=-1, keepdim=False)[0]
+        # 解压
         out = out.unsqueeze(3)
         return out
 
 
+# TAG GCN 权值结合，然后卷积
 class GCN_Block(nn.Module):
     def __init__(self, in_channel):
         super(GCN_Block, self).__init__()
@@ -280,84 +316,103 @@ class GCN_Block(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    # NOTE 双曲正切激活并且内积和将信息聚合到一起
     def attention(self, w):
+        # BN
+        # 双曲正切然后最后一排加空间
+        # BN1
         w = torch.relu(torch.tanh(w)).unsqueeze(-1) #w[32,2000,1] 变成0到1的权重
-        A = torch.bmm(w.transpose(1, 2), w) #A[32,1,1]
-        return A  #  TODO zfy
+        # wT x w
+        # B1N x BN1 ->B11
+        # 特征内积和聚合到一个数值
+        # NOTE
+        A = torch.bmm(w.transpose(1, 2), w ) #A[32,1,1]
+        return A
 
+    '''
+    x与w的结合
+    w处理
+    + A：w双曲正切内积和
+    + A+I求每行的和取倒数然后开方换成对角矩阵得D
+    + L = DAD (BNN)
+    结合
+    + x(BCN1)->BNC
+    + out=L(BNN)@X(BNC)->BNC->BCN1
+    '''
     def graph_aggregation(self, x, w):
         B, _, N, _ = x.size() #B=32,N=2000
+        # 全局上下文嵌入fg = ()
+        # 清空数据
         with torch.no_grad():
             A = self.attention(w) #A[32,1,1]
+            # 生成N*N单位矩阵
             I = torch.eye(N).unsqueeze(0).to(x.device).detach() #I[1,2000,2000]单位矩阵
-            A = A + I #A[32,2000,2000]    TODO zfy
+            A = A + I #A[32,2000,2000]
             D_out = torch.sum(A, dim=-1) #D_out[32,2000]
-            D = (1 / D_out) ** 0.5
+            D = (1 / D_out) ** 0.5 #权的倒数再开方
+            # 对角矩阵
             D = torch.diag_embed(D) #D[32,2000,2000]
+            # DAD
             L = torch.bmm(D, A)
             L = torch.bmm(L, D) #L[32,2000,2000]
+        # 交换成 BCNW->BNCW 每个单体的层次为单位计算
+        # contiguous:确保矩阵在连续物理单元中
         out = x.squeeze(-1).transpose(1, 2).contiguous() #out[32,2000,128]
+        # L(BNN) @ X(BNC)->BNC->BNC1
         out = torch.bmm(L, out).unsqueeze(-1)
+        # BCN1
         out = out.transpose(1, 2).contiguous() #out[32,128,2000,1]
 
         return out
 
     def forward(self, x, w):
         #x[32,128,2000,1],w[32,2000]
+        # NOTE 将我们处理后得特征点和权重进行结合
         out = self.graph_aggregation(x, w)
+        # 卷积
         out = self.conv(out)
         return out
 
 class DS_Block(nn.Module):
     def __init__(self, initial=False, predict=False, out_channel=128, k_num=8, sampling_rate=0.5):
         super(DS_Block, self).__init__()
+        # 是否初始化
         self.initial = initial
+        # 根据是否已经预测确定in channel为4或4
         self.in_channel = 4 if self.initial is True else 6
+        # out channel
         self.out_channel = out_channel
+        # 层数
         self.k_num = k_num
+        # 是否预测
         self.predict = predict
+        # 学习率
         self.sr = sampling_rate
 
+        # conv
         self.conv = nn.Sequential(
             nn.Conv2d(self.in_channel, self.out_channel, (1, 1)), #4或6 → 128
             nn.BatchNorm2d(self.out_channel),
             nn.ReLU(inplace=True)
         )
 
+        # gcn 入口为out_channel
         self.gcn = GCN_Block(self.out_channel)
 
-        # self.embed_0 = nn.Sequential(
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     OABlock(self.out_channel, clusters=256),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        # )
+
+        # 2*ResNet+DGCNN_MAX_Block+OABlock+
         self.embed_0 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
+            # NGCE
             DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
+            # CGCE
             OABlock(self.out_channel, clusters=256),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
         )
-        # self.embed_1 = nn.Sequential(
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-	    #     DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-        # )
         self.embed_1 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
@@ -400,14 +455,20 @@ class DS_Block(nn.Module):
         out = x.transpose(1, 3).contiguous() #contiguous断开out与x的依赖关系。out[32,4或6,2000,1]
         out = self.conv(out) #out[32,128,2000,1]
 
+        # TAG 开始
+        ## NOTE 局部领域上下图+ 簇级图上下文
         out = self.embed_0(out) #NGCE+CGCE=ResNet * 3 + DGCNN_MAX + ResNet * 3 + OABlock + ResNet * 3
         w0 = self.linear_0(out).view(B, -1) #w0[32,2000]
 
+        # NOTE 全局图上下文
         out_g = self.gcn(out, w0.detach()) # GGCE
+
+        # 将簇级和全局的相加
         out = out_g + out
 
         out = self.embed_1(out) #CGCE+NGCE=ResNet * 2 + OABlock + ResNet * 2 + DGCNN_MAX + ResNet * 2
         w1 = self.linear_1(out).view(B, -1) #w1[32,2000]
+        # TAG 结束
 
         if self.predict == False: #剪枝，不预测
             w1_ds, indices = torch.sort(w1, dim=-1, descending=True) #w1排序,w1_ds[32,2000],indices[32,2000]是索引

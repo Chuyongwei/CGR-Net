@@ -2,8 +2,10 @@
 # Author: Jiahui Zhang
 # Date: 2019/09/03
 # E-mail: jiahui-z15@mails.tsinghua.edu.cn
-from thop import profile
 import shutil
+
+from thop import profile
+
 from config import get_config, print_usage
 config, unparsed = get_config()
 import os
@@ -15,10 +17,8 @@ from data import collate_fn, CorrespondencesDataset
 # from oan import CLNet as Model
 #from CLNet_restormer import CLNet as Model
 #from clnet_hgnn import CLNet as Model
-#from clnet import CLNet as Model
-#from icml import CLNet as Model
-from icml11 import CLNet as Model
-#from ncmnet import NCMNet as Model
+# from CGRNet import CGRNet as Model
+from icml import CLNet as Model
 #from stable_gcn_oa_att_resformer import CLNet as Model
 from train import train
 from test import test
@@ -40,19 +40,11 @@ def create_log_dir(config):
         os.makedirs(result_path+'/valid')
     if not os.path.isdir(result_path+'/test'):
         os.makedirs(result_path+'/test')
-        basecode("./",result_path+'/test/att')
     if os.path.exists(result_path+'/config.th'):
         print('warning: will overwrite config file')
     torch.save(config, result_path+'/config.th')
     # path for saving traning logs
     config.log_path = result_path+'/train'
-
-def basecode(src,dest):
-    try:
-        shutil.copytree(src,dest)
-        print("copy")
-    except Exception as e:
-        print(f"basecode error{e}")
 
 def main(config):
     """The main function."""
@@ -61,8 +53,8 @@ def main(config):
 
     model = Model(config)
     model = model.cuda()
-    print('generated parameters:', sum(param.numel() for param in model.parameters()))
 
+    print('generated parameters:', sum(param.numel() for param in model.parameters()))
 
     # Run propper mode
     if config.run_mode == "train":

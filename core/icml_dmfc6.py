@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 替换DMFC模块的信息
 @Evaluation
-map71.75
+map73.25
 '''
 
 

@@ -2,18 +2,149 @@ import torch
 import torch.nn as nn
 from loss import batch_episym
 import numpy as np
-
+import torch.nn.functional as F
 '''
-@Title icml_DeMo2
+@Title icml_gca_dmfc
 @Date: 2025/07/20
 @Author: ChuyongWei
 @Version: 1.1
 @Description:
 加入DeMo的DMFC_block
+
 @Evaluation
-map71.75
+map5 72.92
+
 '''
 
+class CPT(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(CPT, self).__init__()
+
+        self.graph1_conv = nn.Conv2d(2, in_channels, kernel_size=1)
+        self.graph2_conv = nn.Conv2d(2, in_channels, kernel_size=1)
+
+        self.q = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+        self.k = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+        self.v = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+        self.temperature = torch.sqrt(torch.tensor(in_channels))
+        self.temperature2 = torch.sqrt(torch.tensor(in_channels))
+
+    def forward(self, PointCN1, x):
+        q = self.q(PointCN1).squeeze(3)
+        k = self.k(PointCN1).squeeze(3)
+        v = self.v(PointCN1).squeeze(3)
+
+        # x = x.transpose(1, 3).contiguous()
+        graph_1_coordinates = x[:, :2, :, :]  # 形状: [B, 1, N, 2]
+        graph_2_coordinates = x[:, 2:4, :, :] # 形状: [B, 1, N, 2]
+        graph_1 = self.graph1_conv(graph_1_coordinates)
+        graph_2 = self.graph2_conv(graph_2_coordinates)
+        graph_context = graph_1 + graph_2
+        graph_context = graph_context.squeeze(3)
+
+        graph_context_position = torch.matmul(q / self.temperature2, graph_context.transpose(1, 2))
+        attn = torch.matmul(q / self.temperature, k.transpose(1, 2))
+        attn = attn + graph_context_position
+        # attn = self.dropout(F.softmax(attn, dim=-1))
+        attn = F.softmax(attn, dim=-1)
+        output = torch.matmul(attn, v).unsqueeze(3)
+        return output
+
+class MBFFN(nn.Module):
+    def __init__(self, in_channels, out_channels, reduction=4):
+        super(MBFFN, self).__init__()
+        inter_channels = int(in_channels // reduction)
+
+        self.conv_in = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+        self.local_att = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.GELU(),
+            nn.Conv2d(inter_channels, in_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.global_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, inter_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.GELU(),
+            nn.Conv2d(inter_channels, in_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.global_att_max = nn.Sequential(
+            nn.AdaptiveMaxPool2d(1),
+            nn.Conv2d(in_channels, inter_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.GELU(),
+            nn.Conv2d(inter_channels, in_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+        self.conv_out = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+
+
+    def forward(self, x):
+        input_conv = self.conv_in(x)
+
+        scale1 = self.local_att(input_conv)
+        scale2 = self.global_att(input_conv)
+        scale3 = self.global_att_max(input_conv)
+
+        scale_out = scale1 + scale2 + scale3
+        scale_out = self.sigmoid(scale_out)
+        output_conv = self.conv_out(scale_out)
+        out = output_conv + input_conv
+        out = out + x
+        return out
+
+class CGA_Module(nn.Module):
+    def __init__(self, channels):
+        super(CGA_Module, self).__init__()
+        self.CPA = CPT(channels, channels)
+        self.LayerNorm1 = nn.LayerNorm(channels, eps=1e-6)
+        self.MBFFN = MBFFN(channels, channels)
+        self.LayerNorm2 = nn.LayerNorm(channels, eps=1e-6)
+
+
+    def forward(self, feature, Position_feature):
+        # CPT
+        CPT_feature = self.CPA(feature, Position_feature)
+        CPT_feature = CPT_feature + feature
+        # LayerNorm 1
+        CPT_feature_LN1 = CPT_feature.squeeze(3).transpose(-1, -2)
+        CPT_feature_LN1 = self.LayerNorm1(CPT_feature_LN1)
+        CPT_feature_LN1 = CPT_feature_LN1.transpose(-1, -2).unsqueeze(3)
+        # MBFFN
+        MBFFN_feature = self.MBFFN(CPT_feature_LN1)
+        # LayerNorm 2
+        MBFFN_feature_LN2 = MBFFN_feature.squeeze(3).transpose(-1, -2)
+        MBFFN_feature_LN2 = self.LayerNorm2(MBFFN_feature_LN2)
+        MBFFN_feature_LN2 = MBFFN_feature_LN2.transpose(-1, -2).unsqueeze(3)
+        # out
+        out = CPT_feature_LN1 + MBFFN_feature_LN2
+
+        return out
 
 # 维度转换
 class trans(nn.Module):
@@ -682,6 +813,11 @@ class DS_Block(nn.Module):
             DGCNN_MAX_Block(int(self.k_num * 2), self.out_channel),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
+        )
+        self.gca = CGA_Module(self.out_channel)
+        self.embed_01 = nn.Sequential(
+            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+            ResNet_Block(self.out_channel, self.out_channel, pre=False),
             # CGCE
             OABlock(self.out_channel, clusters=256),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
@@ -757,6 +893,8 @@ class DS_Block(nn.Module):
         # TAG 开始
         ## NOTE 局部领域上下图+ 簇级图上下文
         out = self.embed_0(out)  # NGCE+CGCE=ResNet * 3 + DGCNN_MAX + ResNet * 3 + OABlock + ResNet * 3
+        out = self.gca(out,x.transpose(1, 3).contiguous())
+        out = self.embed_01(out)
         w0 = self.linear_0(out).view(B, -1)  # w0[32,2000]
 
         # NOTE 全局图上下文

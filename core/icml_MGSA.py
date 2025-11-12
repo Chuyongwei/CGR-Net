@@ -9,9 +9,11 @@ from einops import rearrange
 @Date: 2025-07-22
 @Version: 1.2
 @Description:
-引用MSGA的OA块
+https://ieeexplore.ieee.org/document/10439184
+引用MSGA的OA块GloBlock替换掉gcn
 
 '''
+
 
 class trans(nn.Module):
     def __init__(self, dim1, dim2):
@@ -21,6 +23,7 @@ class trans(nn.Module):
 
     def forward(self, x):
         return x.transpose(self.dim1, self.dim2)
+
 
 class OAFilter(nn.Module):
     def __init__(self, channels, points, out_channels=None):
@@ -45,7 +48,7 @@ class OAFilter(nn.Module):
 
         # self.gcn = GCN_Block(points)
         # self.linear_0 = nn.Conv2d(points, 1, (1, 1))
-        
+
         self.conv3 = nn.Sequential(
             trans(1, 2),
             nn.InstanceNorm2d(out_channels, eps=1e-3),
@@ -56,16 +59,17 @@ class OAFilter(nn.Module):
 
     def forward(self, x):
         # print(x.size(0))
-        out = self.conv1(x)     
+        out = self.conv1(x)
         # print(out.size())
         # w0 = self.linear_0(out).view(x.size(0), -1) #w0[32,2000]
-        out = out + self.conv2(out) # + self.gcn(out, w0.detach())
+        out = out + self.conv2(out)  # + self.gcn(out, w0.detach())
         out = self.conv3(out)
         if self.shot_cut:
             out = out + self.shot_cut(x)
         else:
             out = out + x
         return out
+
 
 class diff_pool(nn.Module):
     def __init__(self, in_channel, output_points):
@@ -82,6 +86,7 @@ class diff_pool(nn.Module):
         S = torch.softmax(embed, dim=2).squeeze(3)
         out = torch.matmul(x.squeeze(3), S.transpose(1, 2)).unsqueeze(3)
         return out
+
 
 class diff_unpool(nn.Module):
     def __init__(self, in_channel, output_points):
@@ -116,7 +121,6 @@ class OABlock(nn.Module):
         self.l2 = nn.Sequential(*self.l2)
         self.output = nn.Conv2d(channels, 1, kernel_size=1)
         self.shot_cut = nn.Conv2d(channels * 2, channels, kernel_size=1)
-        
 
     def forward(self, data):
         # data: b*c*n*1
@@ -127,6 +131,7 @@ class OABlock(nn.Module):
         x_up = self.up1(x1_1, x2)
         out = torch.cat([x1_1, x_up], dim=1)
         return self.shot_cut(out)
+
 
 class DSBlock(nn.Module):
     def __init__(self, net_channels, clusters=256, knn_num=6):
@@ -144,8 +149,8 @@ class DSBlock(nn.Module):
         # data: b*c*n*1
 
         x1_1 = data
-        x_down = self.down1(x1_1).transpose(1,2)
-        x2 = self.DGCNN_MAX_Block(x_down).transpose(1,2)
+        x_down = self.down1(x1_1).transpose(1, 2)
+        x2 = self.DGCNN_MAX_Block(x_down).transpose(1, 2)
 
         x_up = self.up1(x1_1, x2)
         out = torch.cat([x1_1, x_up], dim=1)
@@ -153,41 +158,43 @@ class DSBlock(nn.Module):
 
 
 def knn(x, k):
-    inner = -2*torch.matmul(x.transpose(2, 1), x) #inner[32,2000,2000]内积？
-    xx = torch.sum(x**2, dim=1, keepdim=True) #xx[32,1,2000]
-    pairwise_distance = -xx - inner - xx.transpose(2, 1) #distance[32,2000,2000]****记得回头看
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)  # inner[32,2000,2000]内积？
+    xx = torch.sum(x ** 2, dim=1, keepdim=True)  # xx[32,1,2000]
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)  # distance[32,2000,2000]****记得回头看
 
-    idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k) [32,2000,9] [32,1000,6]
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k) [32,2000,9] [32,1000,6]
 
     return idx[:, :, :]
 
+
 def get_graph_feature(x, k=20, idx=None):
-    #x[32,128,2000,1],k=9
+    # x[32,128,2000,1],k=9
     # x[32,128,1000,1],k=6
     batch_size = x.size(0)
     num_points = x.size(2)
-    x = x.view(batch_size, -1, num_points) #x[32,128,2000]
+    x = x.view(batch_size, -1, num_points)  # x[32,128,2000]
     if idx is None:
-        idx_out = knn(x, k=k) #idx_out[32,2000,9]
+        idx_out = knn(x, k=k)  # idx_out[32,2000,9]
     else:
         idx_out = idx
 
     device = x.device
 
-    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
 
-    idx = idx_out + idx_base #idx[32,2000,9] 把32个批次的标号连续了
+    idx = idx_out + idx_base  # idx[32,2000,9] 把32个批次的标号连续了
 
-    idx = idx.view(-1) #idx[32*2000*9] 把32个批次连在一起了 [32*1000*6]
+    idx = idx.view(-1)  # idx[32*2000*9] 把32个批次连在一起了 [32*1000*6]
 
     _, num_dims, _ = x.size()
 
-    x = x.transpose(2, 1).contiguous() #x[32,2000,128]
-    feature = x.view(batch_size*num_points, -1)[idx, :]
-    feature = feature.view(batch_size, num_points, k, num_dims) #feature[32,2000,9,128]
-    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1) #x[32,2000,9,128]
-    feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous() #feature[32,256,2000,9] 图特征
+    x = x.transpose(2, 1).contiguous()  # x[32,2000,128]
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)  # feature[32,2000,9,128]
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)  # x[32,2000,9,128]
+    feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous()  # feature[32,256,2000,9] 图特征
     return feature
+
 
 class ResNet_Block(nn.Module):
     def __init__(self, inchannel, outchannel, pre=False):
@@ -212,22 +219,24 @@ class ResNet_Block(nn.Module):
         out = out + x1
         return torch.relu(out)
 
+
 def batch_symeig(X):
     # it is much faster to run symeig on CPU
     X = X.cpu()
     b, d, _ = X.size()
-    bv = X.new(b,d,d)
+    bv = X.new(b, d, d)
     for batch_idx in range(X.shape[0]):
-        #e,v = torch.symeig(X[batch_idx,:,:].squeeze(), True)
+        # e,v = torch.symeig(X[batch_idx,:,:].squeeze(), True)
         e, v = torch.linalg.eigh(X[batch_idx, :, :].squeeze(), UPLO='U')
-        bv[batch_idx,:,:] = v
+        bv[batch_idx, :, :] = v
     bv = bv.cuda()
     return bv
 
+
 def weighted_8points(x_in, logits):
     # x_in: batch * 1 * N * 4 [32,1,500,4] logits[32,2,500,1]
-    mask = logits[:, 0, :, 0] #[32,500] logits的第一层
-    weights = logits[:, 1, :, 0] #[32,500] logits的第二层
+    mask = logits[:, 0, :, 0]  # [32,500] logits的第一层
+    weights = logits[:, 1, :, 0]  # [32,500] logits的第二层
 
     mask = torch.sigmoid(mask)
     weights = torch.exp(weights) * mask
@@ -263,22 +272,23 @@ class DGCNN_MAX_Block(nn.Module):
         self.in_channel = in_channel
 
         self.conv = nn.Sequential(
-            nn.Conv2d(self.in_channel*2, self.in_channel, (1, 1)), #[32,128,2000,9]→[32,128,2000,3]
+            nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 1)),  # [32,128,2000,9]→[32,128,2000,3]
             nn.BatchNorm2d(self.in_channel),
             nn.ReLU(inplace=True),
-            nn.Conv2d(self.in_channel, self.in_channel, (1, 1)), #[32,128,2000,3]→[32,128,2000,1]
+            nn.Conv2d(self.in_channel, self.in_channel, (1, 1)),  # [32,128,2000,3]→[32,128,2000,1]
             nn.BatchNorm2d(self.in_channel),
             nn.ReLU(inplace=True),
-            )
+        )
 
     def forward(self, features):
-        #feature[32,128,2000,1]
+        # feature[32,128,2000,1]
         B, _, N, _ = features.shape
         out = get_graph_feature(features, k=self.knn_num)
-        out = self.conv(out) #out[32,128,2000,1]
+        out = self.conv(out)  # out[32,128,2000,1]
         out = out.max(dim=-1, keepdim=False)[0]
         out = out.unsqueeze(3)
         return out
+
 
 # TAG MSFormer 注意力机制
 # NOTE 多头注意力,将数据conv扩展3C分成KQV三层,然后多头化
@@ -301,8 +311,8 @@ class Attention(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.shape
-        qkv = self.qkv_dwconv(self.qkv(x)) # QKV 卷积 + 深度卷积
-        q, k, v = qkv.chunk(3, dim=1) # 拆成三份：Q, K, V
+        qkv = self.qkv_dwconv(self.qkv(x))  # QKV 卷积 + 深度卷积
+        q, k, v = qkv.chunk(3, dim=1)  # 拆成三份：Q, K, V
         # 多头注意力+L2归一化
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
@@ -359,6 +369,7 @@ class Attention(nn.Module):
         out = self.project_out(out)
         return out
 
+
 # TAG AFF:Attentional feature fusion Squeeze-and-Excitation改进版
 # 融合了 局部注意力 和 全局注意力，来动态地调整通道特征的权重。我们来逐行解析这段 SE_Block 的逻辑和关键点。
 # NOTE 该模块选择性地保留了有效的图形上下文。
@@ -404,6 +415,7 @@ class SE_Block(nn.Module):
         out = wei * x
         return out
 
+
 # TAG MSFormer Topk_ATT+SE的块
 # NOTE 使用BN(x)做输入是一个不错的方法
 class Topk_transformer(nn.Module):
@@ -437,6 +449,7 @@ class Topk_transformer(nn.Module):
         x = x + self.ffn(x_norm)
         return x
 
+
 class LayerBlock(nn.Module):
     def __init__(self, channels, grid=16):
         nn.Module.__init__(self)
@@ -462,6 +475,7 @@ class LayerBlock(nn.Module):
         x = self.downsample(x, x_glo)
         return x
 
+
 class GloBlock(nn.Module):
     def __init__(self, channels, k_num, grid=16):
         nn.Module.__init__(self)
@@ -470,6 +484,7 @@ class GloBlock(nn.Module):
     def forward(self, x):
         out = self.transformer1(x)
         return out
+
 
 class GCN_Block(nn.Module):
     def __init__(self, in_channel):
@@ -482,32 +497,33 @@ class GCN_Block(nn.Module):
         )
 
     def attention(self, w):
-        w = torch.relu(torch.tanh(w)).unsqueeze(-1) #w[32,2000,1] 变成0到1的权重
-        A = torch.bmm(w.transpose(1, 2), w) #A[32,1,1]
-        return A  #  TODO zfy
+        w = torch.relu(torch.tanh(w)).unsqueeze(-1)  # w[32,2000,1] 变成0到1的权重
+        A = torch.bmm(w.transpose(1, 2), w)  # A[32,1,1]
+        return A  # TODO zfy
 
     def graph_aggregation(self, x, w):
-        B, _, N, _ = x.size() #B=32,N=2000
+        B, _, N, _ = x.size()  # B=32,N=2000
         with torch.no_grad():
-            A = self.attention(w) #A[32,1,1]
-            I = torch.eye(N).unsqueeze(0).to(x.device).detach() #I[1,2000,2000]单位矩阵
-            A = A + I #A[32,2000,2000]    TODO zfy
-            D_out = torch.sum(A, dim=-1) #D_out[32,2000]
+            A = self.attention(w)  # A[32,1,1]
+            I = torch.eye(N).unsqueeze(0).to(x.device).detach()  # I[1,2000,2000]单位矩阵
+            A = A + I  # A[32,2000,2000]    TODO zfy
+            D_out = torch.sum(A, dim=-1)  # D_out[32,2000]
             D = (1 / D_out) ** 0.5
-            D = torch.diag_embed(D) #D[32,2000,2000]
+            D = torch.diag_embed(D)  # D[32,2000,2000]
             L = torch.bmm(D, A)
-            L = torch.bmm(L, D) #L[32,2000,2000]
-        out = x.squeeze(-1).transpose(1, 2).contiguous() #out[32,2000,128]
+            L = torch.bmm(L, D)  # L[32,2000,2000]
+        out = x.squeeze(-1).transpose(1, 2).contiguous()  # out[32,2000,128]
         out = torch.bmm(L, out).unsqueeze(-1)
-        out = out.transpose(1, 2).contiguous() #out[32,128,2000,1]
+        out = out.transpose(1, 2).contiguous()  # out[32,128,2000,1]
 
         return out
 
     def forward(self, x, w):
-        #x[32,128,2000,1],w[32,2000]
+        # x[32,128,2000,1],w[32,2000]
         out = self.graph_aggregation(x, w)
         out = self.conv(out)
         return out
+
 
 class DS_Block(nn.Module):
     def __init__(self, initial=False, predict=False, out_channel=128, k_num=8, sampling_rate=0.5):
@@ -520,7 +536,7 @@ class DS_Block(nn.Module):
         self.sr = sampling_rate
 
         self.conv = nn.Sequential(
-            nn.Conv2d(self.in_channel, self.out_channel, (1, 1)), #4或6 → 128
+            nn.Conv2d(self.in_channel, self.out_channel, (1, 1)),  # 4或6 → 128
             nn.BatchNorm2d(self.out_channel),
             nn.ReLU(inplace=True)
         )
@@ -543,7 +559,7 @@ class DS_Block(nn.Module):
         self.embed_0 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
+            DGCNN_MAX_Block(int(self.k_num * 2), self.out_channel),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             OABlock(self.out_channel, clusters=256),
@@ -554,7 +570,7 @@ class DS_Block(nn.Module):
         #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
         #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
         #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
-	    #     DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
+        #     DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
         #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
         #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
         #     ResNet_Block(self.out_channel, self.out_channel, pre=False),
@@ -565,7 +581,7 @@ class DS_Block(nn.Module):
             OABlock(self.out_channel, clusters=128),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
-            DGCNN_MAX_Block(int(self.k_num * 2),self.out_channel),
+            DGCNN_MAX_Block(int(self.k_num * 2), self.out_channel),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
         )
@@ -577,78 +593,83 @@ class DS_Block(nn.Module):
             self.linear_2 = nn.Conv2d(self.out_channel, 2, (1, 1))
 
     def down_sampling(self, x, y, weights, indices, features=None, predict=False):
-        B, _, N , _ = x.size()
-        indices = indices[:, :int(N*self.sr)] #indices[32,1000]剪枝剪掉一半
+        B, _, N, _ = x.size()
+        indices = indices[:, :int(N * self.sr)]  # indices[32,1000]剪枝剪掉一半
         with torch.no_grad():
-            y_out = torch.gather(y, dim=-1, index=indices) #y_out 剪枝后保留的标签[32,1000]
-            w_out = torch.gather(weights, dim=-1, index=indices) #w_out 剪枝后保留的w0[32,1000]
-        indices = indices.view(B, 1, -1, 1) #indices[32,1,1000,1]
+            y_out = torch.gather(y, dim=-1, index=indices)  # y_out 剪枝后保留的标签[32,1000]
+            w_out = torch.gather(weights, dim=-1, index=indices)  # w_out 剪枝后保留的w0[32,1000]
+        indices = indices.view(B, 1, -1, 1)  # indices[32,1,1000,1]
 
         if predict == False:
             with torch.no_grad():
-                x_out = torch.gather(x[:, :, :, :4], dim=2, index=indices.repeat(1, 1, 1, 4)) #x_out 剪枝后保留的x[32,1,1000,4]
+                x_out = torch.gather(x[:, :, :, :4], dim=2,
+                                     index=indices.repeat(1, 1, 1, 4))  # x_out 剪枝后保留的x[32,1,1000,4]
             return x_out, y_out, w_out
         else:
             with torch.no_grad():
-                x_out = torch.gather(x[:, :, :, :4], dim=2, index=indices.repeat(1, 1, 1, 4)) #x_out 剪枝后保留的x[32,1,500,4]
-            feature_out = torch.gather(features, dim=2, index=indices.repeat(1, 128, 1, 1)) #feature_out 剪枝后保留的features[32,128,500,1]
+                x_out = torch.gather(x[:, :, :, :4], dim=2,
+                                     index=indices.repeat(1, 1, 1, 4))  # x_out 剪枝后保留的x[32,1,500,4]
+            feature_out = torch.gather(features, dim=2,
+                                       index=indices.repeat(1, 128, 1, 1))  # feature_out 剪枝后保留的features[32,128,500,1]
             return x_out, y_out, w_out, feature_out
 
     def forward(self, x, y):
         # x[32,1,2000,4],y[32,2000]
         # x_[32,1,1000,6],y1[32,1000]
-        B, _, N , _ = x.size()
-        out = x.transpose(1, 3).contiguous() #contiguous断开out与x的依赖关系。out[32,4或6,2000,1]
-        out = self.conv(out) #out[32,128,2000,1]
+        B, _, N, _ = x.size()
+        out = x.transpose(1, 3).contiguous()  # contiguous断开out与x的依赖关系。out[32,4或6,2000,1]
+        out = self.conv(out)  # out[32,128,2000,1]
 
-        out = self.embed_0(out) #NGCE+CGCE=ResNet * 3 + DGCNN_MAX + ResNet * 3 + OABlock + ResNet * 3
-        w0 = self.linear_0(out).view(B, -1) #w0[32,2000]
+        out = self.embed_0(out)  # NGCE+CGCE=ResNet * 3 + DGCNN_MAX + ResNet * 3 + OABlock + ResNet * 3
+        w0 = self.linear_0(out).view(B, -1)  # w0[32,2000]
 
         # out_g = self.gcn(out, w0.detach()) # GGCE
         out_g = self.glo_block(out)
         out = out_g + out
 
-        out = self.embed_1(out) #CGCE+NGCE=ResNet * 2 + OABlock + ResNet * 2 + DGCNN_MAX + ResNet * 2
-        w1 = self.linear_1(out).view(B, -1) #w1[32,2000]
+        out = self.embed_1(out)  # CGCE+NGCE=ResNet * 2 + OABlock + ResNet * 2 + DGCNN_MAX + ResNet * 2
+        w1 = self.linear_1(out).view(B, -1)  # w1[32,2000]
 
-        if self.predict == False: #剪枝，不预测
-            w1_ds, indices = torch.sort(w1, dim=-1, descending=True) #w1排序,w1_ds[32,2000],indices[32,2000]是索引
-            w1_ds = w1_ds[:, :int(N*self.sr)] #w1_ds[32,1000]剪枝？剪掉一半 self.sr=0.5
+        if self.predict == False:  # 剪枝，不预测
+            w1_ds, indices = torch.sort(w1, dim=-1, descending=True)  # w1排序,w1_ds[32,2000],indices[32,2000]是索引
+            w1_ds = w1_ds[:, :int(N * self.sr)]  # w1_ds[32,1000]剪枝？剪掉一半 self.sr=0.5
             x_ds, y_ds, w0_ds = self.down_sampling(x, y, w0, indices, None, self.predict)
-            #x_ds[32,1,1000,4],y_ds[32,1000],w0_ds[32,1000],ds：剪枝后？
+            # x_ds[32,1,1000,4],y_ds[32,1000],w0_ds[32,1000],ds：剪枝后？
             return x_ds, y_ds, [w0, w1], [w0_ds, w1_ds]
-        else: #剪枝，出预测结果
-            w1_ds, indices = torch.sort(w1, dim=-1, descending=True) #w1排序,w1_ds[32,1000],indices[32,1000]是索引
-            w1_ds = w1_ds[:, :int(N*self.sr)] #w1_ds[32,500]剪枝？剪掉一半 self.sr=0.5
+        else:  # 剪枝，出预测结果
+            w1_ds, indices = torch.sort(w1, dim=-1, descending=True)  # w1排序,w1_ds[32,1000],indices[32,1000]是索引
+            w1_ds = w1_ds[:, :int(N * self.sr)]  # w1_ds[32,500]剪枝？剪掉一半 self.sr=0.5
             x_ds, y_ds, w0_ds, out = self.down_sampling(x, y, w0, indices, out, self.predict)
             # x_ds[32,1,500,4],y_ds[32,500],w0_ds[32,500],out[32,128,500,1]也是剪枝后,ds：剪枝后？
             out = self.embed_2(out)
-            w2 = self.linear_2(out) #[32,2,500,1]
+            w2 = self.linear_2(out)  # [32,2,500,1]
             e_hat = weighted_8points(x_ds, w2)
 
             return x_ds, y_ds, [w0, w1, w2[:, 0, :, 0]], [w0_ds, w1_ds], e_hat
+
 
 class CLNet(nn.Module):
     def __init__(self, config):
         super(CLNet, self).__init__()
 
-        self.ds_0 = DS_Block(initial=True, predict=False, out_channel=128, k_num=9, sampling_rate=config.sr)#sampling_rate=0.5
+        self.ds_0 = DS_Block(initial=True, predict=False, out_channel=128, k_num=9,
+                             sampling_rate=config.sr)  # sampling_rate=0.5
         self.ds_1 = DS_Block(initial=False, predict=True, out_channel=128, k_num=6, sampling_rate=config.sr)
 
     def forward(self, x, y):
-        #x[32,1,2000,4],y[32,2000]
+        # x[32,1,2000,4],y[32,2000]
         B, _, N, _ = x.shape
 
-        x1, y1, ws0, w_ds0 = self.ds_0(x, y) # 返回的是x_ds, y_ds, [w0, w1], [w0_ds, w1_ds]
+        x1, y1, ws0, w_ds0 = self.ds_0(x, y)  # 返回的是x_ds, y_ds, [w0, w1], [w0_ds, w1_ds]
 
-        w_ds0[0] = torch.relu(torch.tanh(w_ds0[0])).reshape(B, 1, -1, 1) #变成0到1的权重[32,1,1000,1]
-        w_ds0[1] = torch.relu(torch.tanh(w_ds0[1])).reshape(B, 1, -1, 1) #变成0到1的权重[32,1,1000,1]
-        x_ = torch.cat([x1, w_ds0[0].detach(), w_ds0[1].detach()], dim=-1) #x_[32,1,1000,6] 剪枝后的特征并带上了权重信息
+        w_ds0[0] = torch.relu(torch.tanh(w_ds0[0])).reshape(B, 1, -1, 1)  # 变成0到1的权重[32,1,1000,1]
+        w_ds0[1] = torch.relu(torch.tanh(w_ds0[1])).reshape(B, 1, -1, 1)  # 变成0到1的权重[32,1,1000,1]
+        x_ = torch.cat([x1, w_ds0[0].detach(), w_ds0[1].detach()], dim=-1)  # x_[32,1,1000,6] 剪枝后的特征并带上了权重信息
 
-        x2, y2, ws1, w_ds1, e_hat = self.ds_1(x_, y1) #x_[32,1,1000,6],y1[32,1000]
+        x2, y2, ws1, w_ds1, e_hat = self.ds_1(x_, y1)  # x_[32,1,1000,6],y1[32,1000]
 
         with torch.no_grad():
-            y_hat = batch_episym(x[:, 0, :, :2], x[:, 0, :, 2:], e_hat) #y_hat对称极线距离
-        #print(y_hat)
+            y_hat = batch_episym(x[:, 0, :, :2], x[:, 0, :, 2:], e_hat)  # y_hat对称极线距离
+        # print(y_hat)
         return ws0 + ws1, [y, y, y1, y1, y2], [e_hat], y_hat
 

@@ -9,10 +9,18 @@ from einops import rearrange
 @Date: 2025-10-12
 @Version: 1.0
 @Description:
-加入ACMatch的lclayer和MGSA的glo块
+加入ACMatch的lclayer替换Max_DGCNN
+修改的地方就是max后做了一次卷积
+MGSA的glo块替换gcn
 
 @Evaluation
-评价
+glo模块有做长距离的估计，不过计算复杂度上有提升
+效果估计不会很理想，因为lclayer的效果不是突出
+
+测试出来之后发现效果还行
+glo 70.43
+lcl 70.08
+glo+lcl 71.3
 '''
 
 
@@ -66,6 +74,8 @@ class LCLayer(nn.Module):
 # TAG MSFormer 注意力机制
 # NOTE 多头注意力,将数据conv扩展3C分成KQV三层,然后多头化
 # attn = KQ
+# 分级多种注意力*各自softmax
+#
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=4):
         nn.Module.__init__(self)
@@ -109,17 +119,14 @@ class Attention(nn.Module):
         # torch.where(condition, a, b)
         # 等同于output = a if condition else b
         attn1 = torch.where(mask1 > 0, attn, torch.full_like(attn, float('-inf')))
-
         # 稍密集
         index = torch.topk(attn, k=int(C * 2 / 3), dim=-1, largest=True)[1]
         mask2.scatter_(-1, index, 1.)
         attn2 = torch.where(mask2 > 0, attn, torch.full_like(attn, float('-inf')))
-
         # 更密集
         index = torch.topk(attn, k=int(C * 3 / 4), dim=-1, largest=True)[1]
         mask3.scatter_(-1, index, 1.)
         attn3 = torch.where(mask3 > 0, attn, torch.full_like(attn, float('-inf')))
-
         # 最密集的注意力
         index = torch.topk(attn, k=int(C * 4 / 5), dim=-1, largest=True)[1]
         mask4.scatter_(-1, index, 1.)
@@ -192,9 +199,6 @@ class SE_Block(nn.Module):
 
 # TAG MSFormer Topk_ATT+SE的块
 # NOTE 使用BN(x)做输入是一个不错的方法
-# 分级多种注意力*各自softmax
-# 它允许模型关注整个点集中的最相关特征，从而学习长距离依赖关系。
-# 与标准自注意力不同，它通过Top-k稀疏化和多尺度注意力权重（attn1到attn4）融合，设计得相当精巧。
 class Topk_transformer(nn.Module):
     def __init__(self, channels):
         nn.Module.__init__(self)
@@ -216,7 +220,6 @@ class Topk_transformer(nn.Module):
         x_norm = self.norm1(x)
         # BN(x+ SE(x_norm)+ATT(x_norm))
         # BCGG
-
         x_attn = self.attn(x_norm)
         # BCGG
         x_se = self.se_block(x_norm)
@@ -241,17 +244,15 @@ class LayerBlock(nn.Module):
     def forward(self, x):
         # BCN1
         # 分割簇 BCO
-        # 将点云换分成二维网络
         x_up = self.upsample(x)
         # BCGG
         x_up = x_up.reshape(x.shape[0], x.shape[1], self.grid_num, self.grid_num)
-        # 做两边分割
-        # TODO 可以考虑只做一次分割
+        #
         x_glo = self.glo_exchange1(x_up)
         x_glo = self.glo_exchange2(x_glo)
         # BCO
         x_glo = x_glo.reshape(x.shape[0], x.shape[1], self.grid_num * self.grid_num, 1)
-        # BCO
+        #
         x = self.downsample(x, x_glo)
         return x
 

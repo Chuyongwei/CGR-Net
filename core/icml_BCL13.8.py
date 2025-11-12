@@ -1,18 +1,59 @@
 import torch
 import torch.nn as nn
 from loss import batch_episym
-import numpy as np
+import torch.nn.functional as F
 
 '''
-@Title icml_DeMo2
-@Date: 2025/07/20
+@Title: icml_BCL13.8
 @Author: ChuyongWei
-@Version: 1.1
+@Date: 2025-09-24
+@Version: 2.0
 @Description:
-加入DeMo的DMFC_block
+尝试在加入NGCE+CGCE之后加入motion融入BCRBlock
+
+4.加入att模块将前面max和out进行融合
+5.由于4发生了过拟合经过检查发现aff和bcr的代码相似，是不正常的现象因此做修改，将att的思路带入bcr
+8.这次加入gca模块
 @Evaluation
-map71.75
+map5 71.08
+4.map5 70.43
+8.map5 71.375
+原文中这块方法原本是用于`运动`的注入方式但是现在修改为了用于隐式和显式的特征融合
+？？？
+我看BCL是用的隐式和显式的，不过就是说如果使用了显式和隐式的方法的话就显的重复了
+
 '''
+
+
+class AFF(nn.Module):
+    def __init__(self, channels=64, r=4):
+        super(AFF, self).__init__()
+        inter_channels = int(channels // r)
+        self.local_att = nn.Sequential(
+            nn.Conv2d(channels, inter_channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(channels),
+        )
+        self.global_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, inter_channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(channels),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, residual):
+        xa = x + residual
+        xl = self.local_att(xa)
+        xg = self.global_att(xa)
+        xlg = xl + xg
+        wei = self.sigmoid(xlg)
+        xo = 2 * x * wei + 2 * residual * (1 - wei)
+        return xo
 
 
 # 维度转换
@@ -25,47 +66,145 @@ class trans(nn.Module):
     def forward(self, x):
         return x.transpose(self.dim1, self.dim2)
 
-class PointCN(nn.Module):
-    def __init__(self, channels, out_channels=None, use_bn=True, use_short_cut=True):
-        nn.Module.__init__(self)
-        if not out_channels:
-           out_channels = channels
 
-        self.use_short_cut=use_short_cut
-        if use_short_cut:
-            self.shot_cut = None
-            if out_channels != channels:
-                self.shot_cut = nn.Conv2d(channels, out_channels, kernel_size=1)
-        if use_bn:
-            self.conv = nn.Sequential(
-                    nn.InstanceNorm2d(channels, eps=1e-3),
-                    # 不同点
-                    nn.BatchNorm2d(channels),
-                    nn.ReLU(True),
-                    nn.Conv2d(channels, out_channels, kernel_size=1),
-                    nn.InstanceNorm2d(out_channels, eps=1e-3),
-                    # 不同点
-                    nn.BatchNorm2d(out_channels),
-                    nn.ReLU(True),
-                    nn.Conv2d(out_channels, out_channels, kernel_size=1)
-                    )
-        else:
-            self.conv = nn.Sequential(
-                    nn.InstanceNorm2d(channels, eps=1e-3),
-                    nn.ReLU(),
-                    nn.Conv2d(channels, out_channels, kernel_size=1),
-                    nn.InstanceNorm2d(out_channels, eps=1e-3),
-                    nn.ReLU(),
-                    nn.Conv2d(out_channels, out_channels, kernel_size=1)
-                    )
+class CPT(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(CPT, self).__init__()
+
+        self.graph1_conv = nn.Conv2d(2, in_channels, kernel_size=1)
+        self.graph2_conv = nn.Conv2d(2, in_channels, kernel_size=1)
+
+        self.q = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+        self.k = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+        self.v = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU()
+        )
+        self.temperature = torch.sqrt(torch.tensor(in_channels))
+        self.temperature2 = torch.sqrt(torch.tensor(in_channels))
+
+    def forward(self, PointCN1, x):
+        q = self.q(PointCN1).squeeze(3)
+        k = self.k(PointCN1).squeeze(3)
+        v = self.v(PointCN1).squeeze(3)
+
+        # NOTE Geometric Semantic Extraction (GSE) 几何语义提取
+        # 当整合予以信息信息确保了一个清晰并且强健的图像对关系的编码
+        # x = x.transpose(1, 3).contiguous()
+        graph_1_coordinates = x[:, :2, :, :]  # 形状: [B, 2, N, 1]
+        graph_2_coordinates = x[:, 2:4, :, :]  # 形状: [B, 2, N, 1]
+        graph_1 = self.graph1_conv(graph_1_coordinates)
+        graph_2 = self.graph2_conv(graph_2_coordinates)
+        graph_context = graph_1 + graph_2
+        graph_context = graph_context.squeeze(3)  # B2N1
+
+        # GCP = Q/t@gT
+        #  ATT = Q/t @ KT
+        # BCN@BNC 计算邻居点的相似度
+        #
+        graph_context_position = torch.matmul(q / self.temperature2, graph_context.transpose(1, 2))
+        attn = torch.matmul(q / self.temperature, k.transpose(1, 2))
+        # NOTE  Geometric Semantic Feature Fusion (GSFF) - 几何语义特征融合
+        attn = attn + graph_context_position
+        # attn = self.dropout(F.softmax(attn, dim=-1))
+        #  SoftMax功能使相关矩阵归一化以产生注意力权重，从而有效地捕获了特征点之间的长期依赖性。
+        attn = F.softmax(attn, dim=-1)
+        output = torch.matmul(attn, v).unsqueeze(3)
+        return output
+
+
+# Multi-Branch Feed Forward Network, MBFFN
+class MBFFN(nn.Module):
+    def __init__(self, in_channels, out_channels, reduction=4):
+        super(MBFFN, self).__init__()
+        inter_channels = int(in_channels // reduction)
+
+        self.conv_in = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+        self.local_att = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.GELU(),
+            nn.Conv2d(inter_channels, in_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.global_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, inter_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.GELU(),
+            nn.Conv2d(inter_channels, in_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.global_att_max = nn.Sequential(
+            nn.AdaptiveMaxPool2d(1),
+            nn.Conv2d(in_channels, inter_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.GELU(),
+            nn.Conv2d(inter_channels, in_channels,
+                      kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+        self.conv_out = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
-        out = self.conv(x)
-        if self.use_short_cut:
-            if self.shot_cut:
-                out = out + self.shot_cut(x)
-            else:
-                out = out + x
+        input_conv = self.conv_in(x)
+
+        scale1 = self.local_att(input_conv)
+        scale2 = self.global_att(input_conv)
+        scale3 = self.global_att_max(input_conv)
+
+        scale_out = scale1 + scale2 + scale3
+        scale_out = self.sigmoid(scale_out)
+        output_conv = self.conv_out(scale_out)
+        out = output_conv + input_conv
+        out = out + x
+        return out
+
+
+class CGA_Module(nn.Module):
+    def __init__(self, channels):
+        super(CGA_Module, self).__init__()
+        self.CPA = CPT(channels, channels)
+        self.LayerNorm1 = nn.LayerNorm(channels, eps=1e-6)
+        self.MBFFN = MBFFN(channels, channels)
+        self.LayerNorm2 = nn.LayerNorm(channels, eps=1e-6)
+
+    def forward(self, feature, Position_feature):
+        # out x
+        # CPT
+        CPT_feature = self.CPA(feature, Position_feature)
+        #
+        CPT_feature = CPT_feature + feature
+        # LayerNorm 1
+        CPT_feature_LN1 = CPT_feature.squeeze(3).transpose(-1, -2)
+        CPT_feature_LN1 = self.LayerNorm1(CPT_feature_LN1)
+        CPT_feature_LN1 = CPT_feature_LN1.transpose(-1, -2).unsqueeze(3)
+        # MBFFN
+        MBFFN_feature = self.MBFFN(CPT_feature_LN1)
+        # LayerNorm 2
+        MBFFN_feature_LN2 = MBFFN_feature.squeeze(3).transpose(-1, -2)
+        MBFFN_feature_LN2 = self.LayerNorm2(MBFFN_feature_LN2)
+        MBFFN_feature_LN2 = MBFFN_feature_LN2.transpose(-1, -2).unsqueeze(3)
+        # out
+        out = CPT_feature_LN1 + MBFFN_feature_LN2
+
         return out
 
 
@@ -156,207 +295,6 @@ class diff_unpool(nn.Module):
         return out
 
 
-class DGCNN_Layer(nn.Module):
-    def __init__(self, knn_num=10, in_channel=128):
-        super(DGCNN_Layer, self).__init__()
-        self.knn_num = knn_num
-        self.in_channel = in_channel
-
-        assert self.knn_num == 9 or self.knn_num == 6
-        if self.knn_num == 9:
-            self.conv = nn.Sequential(
-                nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 3), stride=(1, 3)),
-                # [32,128,2000,9]→[32,128,2000,3]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),  # [32,128,2000,3]→[32,128,2000,1]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True),
-            )
-        if self.knn_num == 6:
-            self.conv = nn.Sequential(
-                nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 3), stride=(1, 3)),
-                # [32,128,2000,6]→[32,128,2000,2]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(self.in_channel, self.in_channel, (1, 2)),  # [32,128,2000,2]→[32,128,2000,1]
-                nn.BatchNorm2d(self.in_channel),
-                nn.ReLU(inplace=True)
-            )
-
-    def forward(self, x):
-        # print(self.knn_num)
-        out = self.conv(x)  # BCN1
-        return out
-class AdaptiveSampling(nn.Module):
-    def __init__(self, in_channel, num_sampling, use_bn=True):
-        nn.Module.__init__(self)
-        self.num_sampling = num_sampling
-        if use_bn:
-            self.conv = nn.Sequential(
-                nn.InstanceNorm2d(in_channel, eps=1e-3),
-                nn.BatchNorm2d(in_channel),
-                nn.ReLU(),
-                nn.Conv2d(in_channel, num_sampling, kernel_size=1))
-        else:
-            self.conv = nn.Sequential(
-                nn.InstanceNorm2d(in_channel, eps=1e-3),
-                nn.ReLU(),
-                nn.Conv2d(in_channel, num_sampling, kernel_size=1))
-
-    def forward(self, F, P):
-        # F: BCN--->BCN1
-        F = F.unsqueeze(3)
-        weights = self.conv(F)  # BCN1
-        W = torch.softmax(weights, dim=2).squeeze(3)  # BMN1
-        # BCN @ BNM
-        # 1 128 48
-        F_M = torch.bmm(F.squeeze(3), W.transpose(1, 2))
-        # 1 128 2000 9 x 1 48 128
-        P_M = torch.bmm(P, W.transpose(1, 2))
-        return F_M, P_M
-
-
-class LearnableKernel(nn.Module):
-    def __init__(self, channels, head, beta, beta_learnable=True):
-        nn.Module.__init__(self)
-        # FIX TAG pos的输入陈了channls//2 --》 channel
-        self.pos_filter, self.value_filter = nn.Conv1d(channels , channels // 2, kernel_size=1), \
-            nn.Conv1d(channels, channels, kernel_size=1)
-        self.channels = channels
-        self.head = head
-        self.head_dim = channels // head
-        self.beta = beta
-        if beta_learnable:
-            self.beta = nn.Parameter(torch.from_numpy(np.asarray([self.beta], dtype=np.float32)))
-
-    def forward(self, pos_bot, corr_feats):
-        batch_size = corr_feats.shape[0]
-        pos, value = self.pos_filter(pos_bot).view(batch_size, self.head, self.head_dim // 2, -1), \
-            self.value_filter(corr_feats).view(batch_size, self.head, self.head_dim, -1)
-        # B1MC
-        pos = pos.squeeze(1)
-        kernel = (-torch.cdist(pos.transpose(1, 2), pos.transpose(1, 2)) ** 2 * self.beta).exp()  # Gaussian kernel
-        equation_F = value.transpose(2, 3).contiguous().squeeze(1)  # BMC
-        return kernel, equation_F
-
-
-class AttentionPropagation(nn.Module):
-    def __init__(self, channels, head):
-        nn.Module.__init__(self)
-        self.head = head
-        self.head_dim = channels // head
-        self.query_filter, self.key_filter, self.value_filter = nn.Conv1d(channels, channels, kernel_size=1), \
-            nn.Conv1d(channels, channels, kernel_size=1), \
-            nn.Conv1d(channels, channels, kernel_size=1)
-        self.mh_filter = nn.Conv1d(channels, channels, kernel_size=1)
-        self.cat_filter = nn.Sequential(
-            nn.Conv1d(2 * channels, 2 * channels, kernel_size=1),
-            nn.BatchNorm1d(2 * channels), nn.ReLU(),
-            nn.Conv1d(2 * channels, channels, kernel_size=1),
-        )
-
-    def forward(self, motion1, motion2):
-        # motion1(q) attend to motion(k,v)
-        batch_size = motion1.shape[0]
-        query, key, value = self.query_filter(motion1).view(batch_size, self.head, self.head_dim, -1), \
-            self.key_filter(motion2).view(batch_size, self.head, self.head_dim, -1), \
-            self.value_filter(motion2).view(batch_size, self.head, self.head_dim, -1)
-        score = torch.softmax(torch.einsum('bhdn,bhdm->bhnm', query, key) / self.head_dim ** 0.5, dim=-1)
-        add_value = torch.einsum('bhnm,bhdm->bhdn', score, value).reshape(batch_size, self.head_dim * self.head, -1)
-        add_value = self.mh_filter(add_value)
-        motion1_new = motion1 + self.cat_filter(torch.cat([motion1, add_value], dim=1))
-        return motion1_new
-
-# NOTE 为了解决大量异常值的情况下生成一个稳健且具有代表性的而深层基础运动场，我们将其表述为某个正则化下的优化问题。
-class DMFC_block(nn.Module):
-    '''
-    channels: 特征通道数
-    lamda: 正则化系数（用于岭回归）
-    beta: 核函数参数
-    layer: 当前层索引（未在前向中使用）
-    head: 注意力头数
-    ker_head: 核学习头数
-    num_sampling: 采样点数量
-    lamda_learnable: 是否让正则化系数可学习
-    use_bn: 是否使用批量归一化（仅用于特征权重模块）
-    '''
-
-    def __init__(self, channels, lamda, beta, layer, head, ker_head, num_sampling, lamda_learnable=True, use_bn=True):
-        nn.Module.__init__(self)
-        self.lamda = lamda
-        self.head = head
-        self.ker_head = ker_head
-        self.min_value = 0.05
-        self.max_value = 0.95
-        self.channels = channels
-        self.num_sampling = num_sampling
-        self.layer = layer
-        self.beta = beta
-        if lamda_learnable:
-            self.lamda = nn.Parameter(torch.from_numpy(np.asarray([self.lamda], dtype=np.float32)))
-
-        # AdaptiveSampling: 自适应采样模块（选择关键点）
-        #
-        self.sampling = AdaptiveSampling(channels, self.num_sampling)
-        # LearnableKernel: 可学习核函数模块（生成核矩阵）
-        self.kernel = LearnableKernel(channels, self.ker_head, self.beta, True)
-        # AttentionPropagation: 注意力传播模块（特征校正）
-        #
-        # inject: 特征注入（公式17）
-        #
-        # rectify1: 第一次校正
-        #
-        # rectify: 最终校正（公式18）
-        self.inject = AttentionPropagation(channels, self.head)
-        self.rectify1 = AttentionPropagation(channels, self.head)
-        self.rectify = AttentionPropagation(channels, self.head)
-
-        '''
-        生成每个采样点的权重（0.05-0.95范围内）
-        使用Sigmoid确保权重在[0,1]范围内
-        '''
-        self.feats_weight = nn.Sequential(nn.BatchNorm1d(channels), \
-                                          nn.ReLU(True), \
-                                          nn.Conv1d(channels, 1, kernel_size=1), \
-                                          nn.Sigmoid())
-
-    def forward(self, pos, corr_feats):
-        # NOTE 预处理
-        # BCN1->BCN
-        corr_feats = corr_feats.squeeze(3)
-        pos = pos.squeeze(3)
-        #  自适应采样
-        feats_repre, pos = self.sampling(corr_feats, pos)
-        # 特征注入（公式17）
-        feats_repre = self.inject(feats_repre, corr_feats)  # Eq.(17)
-        # 特征权重计算
-        # BCM->B1M->BM1
-        W_feats = self.feats_weight(feats_repre).transpose(1, 2)
-        W_feats = torch.clamp(W_feats, self.min_value, self.max_value)  # [0.05, 0.95]
-        # 核矩阵学习
-        # BCM -> BMM, BMC
-        kernel, equation_F = self.kernel(pos, feats_repre)
-        # 加权回归
-        # BMM @ BMC -> BMC
-        w_F = torch.mul(W_feats, equation_F)  # BMC
-        w_kernel = torch.mul(W_feats, kernel)  # BMM
-        w_kernel_w = torch.mul(W_feats, w_kernel.transpose(1, 2))  # BMM
-        I = torch.eye(w_kernel_w.shape[2], device=w_kernel_w.device)
-
-        equa_left = (w_kernel_w + self.lamda * I).to(torch.float32)
-        # C = torch.bmm(torch.inverse(equa_left), w_F.to(torch.float32))  # BMC
-        diag_reg = 1e-6 * torch.eye(equa_left.size(-1), device=equa_left.device)
-        equa_left_reg = equa_left + diag_reg
-        C = torch.bmm(torch.inverse(equa_left_reg), w_F.to(torch.float32))
-        pre_feats_repre = torch.bmm(kernel, C).transpose(1, 2).contiguous()  # Eq.(11): BCM
-        # 特征矫正
-        pre_feats_repre = self.rectify1(feats_repre, pre_feats_repre)
-
-        corr_feats = self.rectify(corr_feats, pre_feats_repre)  # Eq.(18): BCN
-
-        return corr_feats.unsqueeze(3)  # BCN1
-
 class OABlock(nn.Module):
     def __init__(self, net_channels, depth=6, clusters=250):
         nn.Module.__init__(self)
@@ -419,7 +357,7 @@ def knn(x, k):
     inner = -2 * torch.matmul(x.transpose(2, 1), x)  # inner[32,2000,2000]内积？
     xx = torch.sum(x ** 2, dim=1, keepdim=True)  # xx[32,1,2000]
     pairwise_distance = -xx - inner - xx.transpose(2, 1)  # distance[32,2000,2000]****记得回头看
-
+    # 返回(values, indices)
     idx = pairwise_distance.topk(k=k, dim=-1)[1]  # (batch_size, num_points, k) [32,2000,9] [32,1000,6]
 
     return idx[:, :, :]
@@ -453,35 +391,6 @@ def get_graph_feature(x, k=20, idx=None):
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)  # x[32,2000,9,128]
     feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous()  # feature[32,256,2000,9] 图特征
     return feature
-
-# 构造一个获取特征的卷积层
-class Conv_to_feature(nn.Module):
-    def __init__(self, knn_num=9, in_channel=128):
-        super(Conv_to_feature, self).__init__()
-        self.knn_num = knn_num
-        self.in_channel = in_channel
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(self.in_channel*2, self.in_channel, (1, 1)), #[32,128,2000,9]→[32,128,2000,3]
-            nn.BatchNorm2d(self.in_channel),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(self.in_channel, self.in_channel, (1, 1)), #[32,128,2000,3]→[32,128,2000,1]
-            nn.BatchNorm2d(self.in_channel),
-            nn.ReLU(inplace=True),
-            )
-
-    def forward(self, features):
-        #feature[32,128,2000,1]
-        B, _, N, _ = features.shape
-        # 获取高维特征映射结构为KxK，我们来制作knn块
-        out = get_graph_feature(features, k=self.knn_num)
-        # 卷积
-        out = self.conv(out) #out[32,128,2000,1]
-        # 解压
-        out = out.unsqueeze(3)
-        return out
-
-
 
 
 # NOTE 残差网络有助于解决梯度爆炸/消失的问题
@@ -585,6 +494,158 @@ class DGCNN_MAX_Block(nn.Module):
         return out
 
 
+# FIX 修改前
+class PointCN(nn.Module):
+    def __init__(self, channels, out_channels=None, use_bn=True, use_short_cut=True):
+        nn.Module.__init__(self)
+        if not out_channels:
+            out_channels = channels
+
+        self.use_short_cut = use_short_cut
+        if use_short_cut:
+            self.shot_cut = None
+            if out_channels != channels:
+                self.shot_cut = nn.Conv2d(channels, out_channels, kernel_size=1)
+        if use_bn:
+            self.conv = nn.Sequential(
+                nn.InstanceNorm2d(channels, eps=1e-3),
+                # 不同点
+                nn.BatchNorm2d(channels),
+                nn.ReLU(True),
+                nn.Conv2d(channels, out_channels, kernel_size=1),
+                nn.InstanceNorm2d(out_channels, eps=1e-3),
+                # 不同点
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(True),
+                nn.Conv2d(out_channels, out_channels, kernel_size=1)
+            )
+        else:
+            self.conv = nn.Sequential(
+                nn.InstanceNorm2d(channels, eps=1e-3),
+                nn.ReLU(),
+                nn.Conv2d(channels, out_channels, kernel_size=1),
+                nn.InstanceNorm2d(out_channels, eps=1e-3),
+                nn.ReLU(),
+                nn.Conv2d(out_channels, out_channels, kernel_size=1)
+            )
+
+    def forward(self, x):
+        out = self.conv(x)
+        if self.use_short_cut:
+            if self.shot_cut:
+                out = out + self.shot_cut(x)
+            else:
+                out = out + x
+        return out
+
+
+class DGCNN_Layer(nn.Module):
+    def __init__(self, knn_num=10, in_channel=128):
+        super(DGCNN_Layer, self).__init__()
+        self.knn_num = knn_num
+        self.in_channel = in_channel
+
+        assert self.knn_num == 9 or self.knn_num == 6
+        if self.knn_num == 9:
+            self.conv = nn.Sequential(
+                nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 3), stride=(1, 3)),
+                # [32,128,2000,9]→[32,128,2000,3]
+                nn.BatchNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),  # [32,128,2000,3]→[32,128,2000,1]
+                nn.BatchNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        if self.knn_num == 6:
+            self.conv = nn.Sequential(
+                nn.Conv2d(self.in_channel * 2, self.in_channel, (1, 3), stride=(1, 3)),
+                # [32,128,2000,6]→[32,128,2000,2]
+                nn.BatchNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 2)),  # [32,128,2000,2]→[32,128,2000,1]
+                nn.BatchNorm2d(self.in_channel),
+                nn.ReLU(inplace=True)
+            )
+
+    def forward(self, x):
+        # print(self.knn_num)
+        out = self.conv(x)  # BCN1
+        return out
+
+
+# TAG 计算权重
+# NOTE 计算全局我们当然要使用到权重
+class BEBlock(nn.Module):
+    def __init__(self, channels, r=4, k_num=8):
+        super(BEBlock, self).__init__()
+        self.k_num = k_num
+        inter_channels = int(channels // r)
+
+        self.project_be = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU()
+        )
+
+        self.project_knn = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU()
+        )
+
+        # NOTE 计算均值的话。。我们就能看到全局的影响
+        self.global_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # b*128*1*1
+            nn.Conv2d(channels, inter_channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(channels),
+        )
+
+        self.local_att = DGCNN_Layer(self.k_num, channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 获取特征
+        x1 = self.project_be(x)
+
+        # 获取局部的特征
+        x_local = self.project_knn(x1)
+        x_local = self.local_att(get_graph_feature(x_local, k=self.k_num))
+
+        # 平均池全局搜索
+        # 然后加上局部特征就是我们的样本了，使用sigmoid函数获取权重
+        xlg = self.global_att(x1) + x_local
+        weight = self.sigmoid(xlg)
+        return weight
+
+
+# TAG 全局获取模块
+class BCRBlock(nn.Module):
+    def __init__(self, channels, k_num=8, r=4):
+        super(BCRBlock, self).__init__()
+        self.channels = channels
+        self.ratio = r
+        self.k = k_num
+        self.Weight = BEBlock(channels, self.ratio, self.k)
+        self.resnet_1 = ResNet_Block(self.channels, self.channels, pre=True)
+        self.resnet_12 = ResNet_Block(self.channels * 2, self.channels, pre=True)
+        self.resnet_2 = nn.Sequential(
+            ResNet_Block(self.channels, self.channels, pre=False),
+            ResNet_Block(self.channels, self.channels, pre=False),
+            ResNet_Block(self.channels, self.channels, pre=False)
+        )
+
+    def forward(self, x, residual):
+        x_1 = x + residual
+        x_1 = self.resnet_1(x_1)
+        wei = self.Weight(x_1)
+        x = 2 * x * wei + 2 * residual * (1 - wei)
+        x = self.resnet_2(x)
+        return x
+
+
 # TAG GCN 权值结合，然后卷积
 class GCN_Block(nn.Module):
     def __init__(self, in_channel):
@@ -596,15 +657,30 @@ class GCN_Block(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    # NOTE 激活并且切换
+    # NOTE 双曲正切激活并且内积和将信息聚合到一起
     def attention(self, w):
+        # BN
         # 双曲正切然后最后一排加空间
+        # BN1
         w = torch.relu(torch.tanh(w)).unsqueeze(-1)  # w[32,2000,1] 变成0到1的权重
         # wT x w
+        # B1N x BN1 ->B11
+        # 特征内积和聚合到一个数值
+        # NOTE
         A = torch.bmm(w.transpose(1, 2), w)  # A[32,1,1]
         return A
 
-    # x与w的结合
+    '''
+    x与w的结合
+    w处理
+    + A：w双曲正切内积和
+    + A+I求每行的和取倒数然后开方换成对角矩阵得D
+    + L = DAD (BNN)
+    结合
+    + x(BCN1)->BNC
+    + out=L(BNN)@X(BNC)->BNC->BCN1
+    '''
+
     def graph_aggregation(self, x, w):
         B, _, N, _ = x.size()  # B=32,N=2000
         # 全局上下文嵌入fg = ()
@@ -624,14 +700,18 @@ class GCN_Block(nn.Module):
         # 交换成 BCNW->BNCW 每个单体的层次为单位计算
         # contiguous:确保矩阵在连续物理单元中
         out = x.squeeze(-1).transpose(1, 2).contiguous()  # out[32,2000,128]
+        # L(BNN) @ X(BNC)->BNC->BNC1
         out = torch.bmm(L, out).unsqueeze(-1)
+        # BCN1
         out = out.transpose(1, 2).contiguous()  # out[32,128,2000,1]
 
         return out
 
     def forward(self, x, w):
         # x[32,128,2000,1],w[32,2000]
+        # NOTE 将我们处理后得特征点和权重进行结合
         out = self.graph_aggregation(x, w)
+        # 卷积
         out = self.conv(out)
         return out
 
@@ -651,7 +731,6 @@ class DS_Block(nn.Module):
         self.predict = predict
         # 学习率
         self.sr = sampling_rate
-        # self.lamda = config.lamda
 
         # conv
         self.conv = nn.Sequential(
@@ -660,26 +739,30 @@ class DS_Block(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # NOTE GGCE：全局图上下文的聚合
+        self.geom_embed = nn.Sequential(nn.Conv2d(4, self.out_channel, 1), \
+                                        PointCN(self.out_channel))
+
+        # XXX 这边可以考虑加入我们的学习率
+        # BCRBlock(out_channel, self.k_num, self.sr)
+        self.bcr = BCRBlock(out_channel, self.k_num)
+        self.bcr2 = BCRBlock(out_channel, self.k_num)
+
+        self.cpa = CGA_Module(out_channel)
+        # self.aff = AFF(out_channel)
+
         # gcn 入口为out_channel
         self.gcn = GCN_Block(self.out_channel)
 
-        self.geom_embed = nn.Sequential(nn.Conv2d(4, self.out_channel,1),\
-                                        PointCN(self.out_channel))
-
-        self.dgc = DGCNN_Layer(self.k_num,self.out_channel)
-
-        # def __init__(self, channels, lamda, beta, layer, head, ker_head, num_sampling, lamda_learnable=True, use_bn=True)
-        self.dmfc = DMFC_block(self.out_channel,lamda=8,beta=0.1,layer=1,head=4,ker_head=1,num_sampling=48,lamda_learnable=True,use_bn=True)
-
-        # NOTE DGCNN_MAX_Block 提取特征点 NGCE
-        #  OABlock 划分解析簇 CGCE
-        # 2*ResNet+DGCNN_MAX_Block+2*ResNet+OABlock+2*ResNet
-        self.embed_0 = nn.Sequential(
+        # 2*ResNet+DGCNN_MAX_Block+OABlock+
+        self.embed_00 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             # NGCE
             DGCNN_MAX_Block(int(self.k_num * 2), self.out_channel),
+            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+            ResNet_Block(self.out_channel, self.out_channel, pre=False),
+        )
+        self.embed_01 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             # CGCE
@@ -687,7 +770,6 @@ class DS_Block(nn.Module):
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
         )
-        # 2*ResNet+DGCNN_MAX_Block+2*ResNet+OABlock+2*ResNet
         self.embed_1 = nn.Sequential(
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
             ResNet_Block(self.out_channel, self.out_channel, pre=False),
@@ -732,42 +814,28 @@ class DS_Block(nn.Module):
         B, _, N, _ = x.size()
         out = x.transpose(1, 3).contiguous()  # contiguous断开out与x的依赖关系。out[32,4或6,2000,1]
         x1, x2 = out[:, :2, :, :], out[:, 2:4, :, :]
-
         out = self.conv(out)  # out[32,128,2000,1]
-        # 第一次获取特征点，后面还有一次获取
-        out = get_graph_feature(out, self.k_num)
 
-        # 特征卷积 32 128 2000 1
-        # FIX 特征的汇聚变为了环形卷积
-        out = self.dgc(out)
-
-        # 最大值
-        # NOTE 下次这边试试环形卷积
-        out = out.max(dim=-1, keepdim=False)[0]
-        # 解压
-        out = out.unsqueeze(3)
-
-        motion = torch.cat((x1,x2-x1), dim=1)
-
-        #运动卷积 [32 128 2000 1]
+        motion = torch.cat((x1, x2 - x1), dim=1)
         out_m = self.geom_embed(motion)
 
-        out = self.dmfc(out, out_m)
-        # FIX 修改完
         # TAG 开始
         ## NOTE 局部领域上下图+ 簇级图上下文
-        out = self.embed_0(out)  # NGCE+CGCE=ResNet * 3 + DGCNN_MAX + ResNet * 3 + OABlock + ResNet * 3
+        out_max = self.embed_00(out)  # NGCE+CGCE=ResNet * 3 + DGCNN_MAX + ResNet * 3 + OABlock + ResNet * 3
+        out = self.cpa(out,out_max)
+        out = self.embed_01(out_max)
+        # FIX BCRBlock
+        out = self.bcr(out, out_m)
+
         w0 = self.linear_0(out).view(B, -1)  # w0[32,2000]
 
         # NOTE 全局图上下文
         out_g = self.gcn(out, w0.detach())  # GGCE
 
-        # FIX 将簇级和全局做一次运动场优化，我们将其表述为某个正则化下的优化问题。
-        # out = self.dmfc(out, out_g)
-
         # 将簇级和全局的相加
         out = out_g + out
 
+        # out = self.bcr2(torch.cat([out, out_g], dim=1))
         out = self.embed_1(out)  # CGCE+NGCE=ResNet * 2 + OABlock + ResNet * 2 + DGCNN_MAX + ResNet * 2
         w1 = self.linear_1(out).view(B, -1)  # w1[32,2000]
         # TAG 结束

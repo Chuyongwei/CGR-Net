@@ -2,18 +2,211 @@ import torch
 import torch.nn as nn
 from loss import batch_episym
 import numpy as np
+import torch.nn.functional as F
+from einops import rearrange
 
 '''
-@Title icml_DeMo2
-@Date: 2025/07/20
+@Title icml_dmfc2_glo7
+@Date: 2025/11/1
 @Author: ChuyongWei
 @Version: 1.1
 @Description:
 加入DeMo的DMFC_block
+然后搭配上glo7
 @Evaluation
-map71.75
+map73.27
 '''
 
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        nn.Module.__init__(self)
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1)
+        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1)
+        self.attn_drop = nn.Dropout(0.)
+        self.attn1 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+        self.attn2 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+        self.attn3 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+        self.attn4 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.qkv_dwconv(self.qkv(x))  # QKV 卷积 + 深度卷积
+        q, k, v = qkv.chunk(3, dim=1)  # 拆成三份：Q, K, V
+        # 多头注意力+L2归一化
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+        _, _, C, _ = q.shape
+        # 制作0矩阵
+        mask1 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        mask2 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        mask3 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        mask4 = torch.zeros(b, self.num_heads, C, C, device=x.device, requires_grad=False)
+        # BHCC*w(H)
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        # 最稀疏的注意力（保留最强的50%）
+        # NOTE 获取Top-k的索引值
+        index = torch.topk(attn, k=int(C / 2), dim=-1, largest=True)[1]
+        # 把 index 对应位置的值设为 1.0，其余保持为 0.0，用来标记“哪些位置是 Top-K 的注意力得分”。
+        # tensor.scatter_(dim, index, src)
+        # 在 dim 维度上，将 src 中的值根据 index 指定的位置写入 tensor。
+        mask1.scatter_(-1, index, 1.)
+        #  非top-k位置设为 -inf
+        # torch.where(condition, a, b)
+        # 等同于output = a if condition else b
+        attn1 = torch.where(mask1 > 0, attn, torch.full_like(attn, float('-inf')))
+        # 稍密集
+        index = torch.topk(attn, k=int(C * 2 / 3), dim=-1, largest=True)[1]
+        mask2.scatter_(-1, index, 1.)
+        attn2 = torch.where(mask2 > 0, attn, torch.full_like(attn, float('-inf')))
+        # 更密集
+        index = torch.topk(attn, k=int(C * 3 / 4), dim=-1, largest=True)[1]
+        mask3.scatter_(-1, index, 1.)
+        attn3 = torch.where(mask3 > 0, attn, torch.full_like(attn, float('-inf')))
+        # 最密集的注意力
+        index = torch.topk(attn, k=int(C * 4 / 5), dim=-1, largest=True)[1]
+        mask4.scatter_(-1, index, 1.)
+        attn4 = torch.where(mask4 > 0, attn, torch.full_like(attn, float('-inf')))
+
+        # softMax BHCC
+        attn1 = attn1.softmax(dim=-1)
+        attn2 = attn2.softmax(dim=-1)
+        attn3 = attn3.softmax(dim=-1)
+        attn4 = attn4.softmax(dim=-1)
+        # BHCC @ BHC(HW)->BHC(HW)
+        out1 = (attn1 @ v)
+        out2 = (attn2 @ v)
+        out3 = (attn3 @ v)
+        out4 = (attn4 @ v)
+        # 计算加权得分
+        out = out1 * self.attn1 + out2 * self.attn2 + out3 * self.attn3 + out4 * self.attn4
+        # 回来
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        # 给分
+        out = self.project_out(out)
+        return out
+
+
+class SE_Block(nn.Module):
+    def __init__(self, channels):
+        nn.Module.__init__(self)
+        # 首先使用 全局平均池化 提取每个通道的全局上下文表示。
+        # 然后通过两个 3x3 卷积层+BN+ReLU 进行非线性映射，学习全局注意力权重。
+        # 输出 shape 为 (B, C, 1, 1)，表示每个通道的“全局重要性”。
+        self.global_att = nn.Sequential(
+            # NOTE 全局的秘密
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+        # 使用标准的 3x3 卷积提取 局部特征上下文。
+        # 没有池化操作，保留了原始空间结构 (B, C, H, W)。
+        # 相当于一个轻量的通道注意力模块，能感知局部特征的强度或模式。
+        self.local_att = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 局部注意力
+        # BCHW
+        xl = self.local_att(x)
+        # 全局注意力
+        # BCHW
+        xg = self.global_att(x)
+        # 逐通道融合
+        xlg = xl * xg
+        # 计算得分
+        wei = self.sigmoid(xlg)
+
+        out = wei * x
+        return out
+
+# TAG MSFormer Topk_ATT+SE的块
+# NOTE 使用BN(x)做输入是一个不错的方法
+class Topk_transformer(nn.Module):
+    def __init__(self, channels):
+        nn.Module.__init__(self)
+        self.norm1 = nn.BatchNorm2d(channels)
+
+        # self.norm2 = nn.BatchNorm2d(channels)
+        self.attn = Attention(channels, num_heads=4)
+        self.se_block = SE_Block(channels)
+        self.ffn = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x):
+        # BCGG
+        # BN(x)
+        x_norm = self.norm1(x)
+        # BN(x+ SE(x_norm)+ATT(x_norm))
+        # BCGG
+        x_attn = self.attn(x_norm)
+        # BCGG
+        x_se = self.se_block(x_norm)
+
+        x_ffn = self.ffn(x_norm)
+
+        x = x + x_se + x_attn+x_ffn
+        # TODO norm2不再使用
+        # x_norm = self.norm2(x)
+        # CBRC(c/4)
+        # BCGG
+        x = x + self.ffn(x_norm)
+        return x
+
+
+class LayerBlock(nn.Module):
+    def __init__(self, channels, grid=16):
+        nn.Module.__init__(self)
+        self.output = grid * grid
+        self.upsample = diff_pool(channels, self.output)
+        self.grid_num = grid
+        self.glo_exchange1 = Topk_transformer(channels)
+        self.glo_exchange2 = Topk_transformer(channels)
+        self.downsample = diff_unpool(channels, self.output)
+
+    def forward(self, x):
+        # BCN1
+        # 分割簇 BCO
+        x_up = self.upsample(x)
+        # BCGG
+        x_up = x_up.reshape(x.shape[0], x.shape[1], self.grid_num, self.grid_num)
+        #
+        x_glo = self.glo_exchange1(x_up)
+        x_glo = self.glo_exchange2(x_glo)
+        # BCO
+        x_glo = x_glo.reshape(x.shape[0], x.shape[1], self.grid_num * self.grid_num, 1)
+        #
+        x = self.downsample(x, x_glo)
+        return x
+
+
+class GloBlock(nn.Module):
+    def __init__(self, channels, k_num, grid=16):
+        nn.Module.__init__(self)
+        self.transformer1 = LayerBlock(channels, grid)
+
+    def forward(self, x):
+        out = self.transformer1(x)
+        return out
 
 # 维度转换
 class trans(nn.Module):
@@ -662,7 +855,9 @@ class DS_Block(nn.Module):
 
         # NOTE GGCE：全局图上下文的聚合
         # gcn 入口为out_channel
-        self.gcn = GCN_Block(self.out_channel)
+        # self.gcn = GCN_Block(self.out_channel)
+
+        self.glo_block = GloBlock(self.out_channel, k_num=self.k_num)
 
         self.geom_embed = nn.Sequential(nn.Conv2d(4, self.out_channel,1),\
                                         PointCN(self.out_channel))
@@ -760,10 +955,14 @@ class DS_Block(nn.Module):
         w0 = self.linear_0(out).view(B, -1)  # w0[32,2000]
 
         # NOTE 全局图上下文
-        out_g = self.gcn(out, w0.detach())  # GGCE
+        # out_g = self.gcn(out, w0.detach())  # GGCE
+
+        out_g = self.glo_block(out)
 
         # FIX 将簇级和全局做一次运动场优化，我们将其表述为某个正则化下的优化问题。
         # out = self.dmfc(out, out_g)
+
+
 
         # 将簇级和全局的相加
         out = out_g + out

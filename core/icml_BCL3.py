@@ -14,6 +14,8 @@ from einops import rearrange
 但是遇到一个无法与注意力机制进行兼容，太痛了！！！
 这个问题需要解决
 @Evaluation
+baseline：map 68.04
+icml29:map 68.65
 
 '''
 

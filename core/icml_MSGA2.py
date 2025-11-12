@@ -9,8 +9,10 @@ from einops import rearrange
 @Date: 2025-07-22
 @Version: 1.2
 @Description:
+glo替换gcn
 去除上下的OANet
-
+@Evaluation
+map5 70.43
 '''
 
 
@@ -87,6 +89,25 @@ class diff_pool(nn.Module):
         return out
 
 
+# class diff_unpool(nn.Module):
+#     def __init__(self, in_channel, output_points):
+#         nn.Module.__init__(self)
+#         self.output_points = output_points
+#         self.conv = nn.Sequential(
+#             nn.InstanceNorm2d(in_channel, eps=1e-3),
+#             nn.BatchNorm2d(in_channel),
+#             nn.ReLU(),
+#             nn.Conv2d(in_channel, output_points, kernel_size=1))
+#
+#     def forward(self, x_up, x_down):
+#         # x_up: b*c*n*1
+#         # x_down: b*c*k*1
+#         embed = self.conv(x_up)  # b*k*n*1
+#         S = torch.softmax(embed, dim=1).squeeze(3)  # b*k*n
+#         print("x_down",x_down.shape)
+#         out = torch.matmul(x_down.squeeze(3), S).unsqueeze(3)
+#         return out
+
 class diff_unpool(nn.Module):
     def __init__(self, in_channel, output_points):
         nn.Module.__init__(self)
@@ -98,13 +119,15 @@ class diff_unpool(nn.Module):
             nn.Conv2d(in_channel, output_points, kernel_size=1))
 
     def forward(self, x_up, x_down):
-        # x_up: b*c*n*1
-        # x_down: b*c*k*1
-        embed = self.conv(x_up)  # b*k*n*1
-        S = torch.softmax(embed, dim=1).squeeze(3)  # b*k*n
-        out = torch.matmul(x_down.squeeze(3), S).unsqueeze(3)
-        return out
+        # BCN1 BCO
+        # BON1
+        embed = self.conv(x_up)
+        # BON
+        S = torch.softmax(embed, dim=1).squeeze(3)
+        # BCO BON ->BCN1
+        out = torch.matmul(x_down, S).unsqueeze(3)
 
+        return out
 
 class OABlock(nn.Module):
     def __init__(self, net_channels, depth=6, clusters=250):
