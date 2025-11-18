@@ -40,7 +40,7 @@ class AttentionPropagation(nn.Module):
             if kv_mask is not None:
                 QK.masked_fill_(~(kv_mask[:, None, None, :]), float(-1e6))
             score = torch.softmax(QK / self.head_dim ** 0.5, dim=-1)  # BHNM
-            add_value = torch.einsum('bhnm,bhdm->bhdn', score, value).reshape(batch_size, self.head_dim * self.head, -1)
+            add_value = torch.einsum('bhnm,bhdm->bhdn', score, value).reshape(batch_size, self.head_dim * self.head, -1) #BCN
             # assign_mat = torch.mean(torch.softmax(QK/self.head_dim**0.5,dim=-2),dim=1,keepdim=False).permute(0,2,1) # BMN
         elif self.mode == 'linear':
             # set masked position to zero
@@ -88,7 +88,7 @@ class InitProject(nn.Module):
     def forward(self, x):
         return self.init_project(x)
 
-
+# TAG 输出点对权重
 class InlinerPredictor(nn.Module):
     def __init__(self, channels):
         nn.Module.__init__(self)
@@ -105,7 +105,7 @@ class InlinerPredictor(nn.Module):
         # BCN -> B1N
         return self.inlier_pre(d)
 
-
+#TAG 聚合 (cluster) + 上下文 (context) + 反聚合 (decluster)；
 class LayerBlock(nn.Module):
     def __init__(self, channels, head, layer_names, mode='full'):
         nn.Module.__init__(self)
@@ -122,6 +122,7 @@ class LayerBlock(nn.Module):
             mask = weights > 0  # BN
         else:
             mask = None
+        # NOTE 根据不同模式进行聚集
         for layer, name in zip(self.cluster_layers, self.layer_names):
             if name == 'cluster':
                 feat_piece = layer(feat_piece, d, mask)  # BCP, BNP
@@ -163,9 +164,12 @@ class DeMatch(nn.Module):
         motion = x2 - x1  # B2N
 
         pos = x1  # B2N
+        # 位置提取多层卷积依次上升
         pos_embed = self.pos_embed(pos)  # BCN
 
+        # 初始化图
         d = self.init_project(motion) + pos_embed  # BCN
+        # 向量随机权重
         feat_piece = self.piece_tokens.unsqueeze(0).repeat(batch_size, 1, 1)  # CP->BCP
 
         res_logits, res_e_hat = [], []

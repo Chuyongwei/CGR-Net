@@ -6,8 +6,11 @@ from loss import batch_episym
 icml(our)
 我自己的
 随便写写
+6.30
 目前相加一个向量
 然后试试将数据初始化
+7.1
+
 '''
 
 

@@ -139,6 +139,8 @@ def get_graph_feature(x, k=20, idx=None):
     feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous()
     return feature
 
+# o1,o2两种特征相加做局部和全局的卷积相加，然后sigmoid计算权重w
+# o1*w + o2*(1-w)
 class AFF(nn.Module):
     def __init__(self, channels=64, r=4):
         super(AFF, self).__init__()
@@ -202,12 +204,17 @@ class GNN(nn.Module):
     def forward(self, features):
         B, _, N, _ = features.shape
         out = get_graph_feature(features, k=self.knn_num)
+
+        # 普通卷积然后环形卷积
         out_an = self.conv(out)
         out_an = self.change1(out_an)
+
+        # 卷积后得到醉倒值然后卷积
         out_max = self.mlp1(out)
         out_max = out_max.max(dim=-1, keepdim=False)[0]
         out_max = out_max.unsqueeze(3)
         out_max = self.change2(out_max)
+
         out = self.aff(out_max, out_an)
         return out
 
@@ -239,6 +246,10 @@ class PointCN(nn.Module):
         return out
 
 # Context Position Attention, CPT
+# TAG 上下文位置提取器
+#  Global Context Awareness (GCA) 全局上下文感知
+#  Geometric Semantic Extraction (GSE) 几何语义提取
+#  Geometric Semantic Feature Fusion (GSFF) - 几何语义特征融合
 class CPT(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(CPT, self).__init__()
@@ -269,18 +280,26 @@ class CPT(nn.Module):
         k = self.k(PointCN1).squeeze(3)
         v = self.v(PointCN1).squeeze(3)
 
+        # NOTE Geometric Semantic Extraction (GSE) 几何语义提取
+        # 当整合予以信息信息确保了一个清晰并且强健的图像对关系的编码
         # x = x.transpose(1, 3).contiguous()
-        graph_1_coordinates = x[:, :2, :, :]  # 形状: [B, 1, N, 2]
-        graph_2_coordinates = x[:, 2:4, :, :] # 形状: [B, 1, N, 2]
+        graph_1_coordinates = x[:, :2, :, :]  # 形状: [B, 2, N, 1]
+        graph_2_coordinates = x[:, 2:4, :, :] # 形状: [B, 2, N, 1]
         graph_1 = self.graph1_conv(graph_1_coordinates)
         graph_2 = self.graph2_conv(graph_2_coordinates)
         graph_context = graph_1 + graph_2
-        graph_context = graph_context.squeeze(3)
+        graph_context = graph_context.squeeze(3) # B2N1
 
+        # GCP = Q/t@gT BCC
+        #  ATT = Q/t @ KT BCC
+        # BCN@BNC 计算邻居点的相似度
+        # 
         graph_context_position = torch.matmul(q / self.temperature2, graph_context.transpose(1, 2))
         attn = torch.matmul(q / self.temperature, k.transpose(1, 2))
+        # NOTE  Geometric Semantic Feature Fusion (GSFF) - 几何语义特征融合
         attn = attn + graph_context_position
         # attn = self.dropout(F.softmax(attn, dim=-1))
+        #  SoftMax功能使相关矩阵归一化以产生注意力权重，从而有效地捕获了特征点之间的长期依赖性。
         attn = F.softmax(attn, dim=-1)
         output = torch.matmul(attn, v).unsqueeze(3)
         return output
@@ -441,6 +460,7 @@ class DP_OA_DOP_block(nn.Module):
         return x_up
 
 # Contextual Geometric Attention Module, CGA Module
+# CPA and MB-FFN
 class CGA_Module(nn.Module):
     def __init__(self, channels):
         super(CGA_Module, self).__init__()
@@ -451,10 +471,13 @@ class CGA_Module(nn.Module):
 
 
     def forward(self, feature, Position_feature):
+        # out x
         # CPT
         CPT_feature = self.CPA(feature, Position_feature)
+        # TAG 保持原点
         CPT_feature = CPT_feature + feature
         # LayerNorm 1
+        # Lyaert(qT)
         CPT_feature_LN1 = CPT_feature.squeeze(3).transpose(-1, -2)
         CPT_feature_LN1 = self.LayerNorm1(CPT_feature_LN1)
         CPT_feature_LN1 = CPT_feature_LN1.transpose(-1, -2).unsqueeze(3)
@@ -536,10 +559,11 @@ class sub_MGCANet(nn.Module):
     def forward(self, data, xs, i, x_last=None, x_last2=None, init_out=None):
         batch_size, num_pts = data.shape[0], data.shape[2]
         x1_1 = self.conv1(data)
-
+        # TAG 跨阶段多图共识
         # CSMGC_Module
         if x_last is not None:
             # last stage feature
+            # BC
             x1_1_64 = self.conv643(x1_1)
             x_last_64 = self.conv641(x_last)
             x_last2_64 = self.conv642(x_last2)
@@ -666,6 +690,7 @@ class MGCANet(nn.Module):
             res_weights.append(logits), res_e_hat.append(e_hat)
             stage_out.append(out)
 
+        # TAG 将所有最后得out knn后合并做环形卷积注入out2
         sub_l_input = self.CSMGC(stage_out[0], stage_out[1], stage_out[2])
         More_weight = self.M2(self.M1(sub_l_input))
         feature_out = self.covn(More_weight)

@@ -2,9 +2,6 @@
 # Author: Jiahui Zhang
 # Date: 2019/09/03
 # E-mail: jiahui-z15@mails.tsinghua.edu.cn
-import shutil
-
-from thop import profile
 
 from config import get_config, print_usage
 config, unparsed = get_config()

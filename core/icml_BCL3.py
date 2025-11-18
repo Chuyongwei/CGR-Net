@@ -9,10 +9,11 @@ from einops import rearrange
 @Date 2025/07/18
 @Description
 1.将BCMA替换原来的DGCNN_MAX_Block
-2.尝试结尾加上BCMA
 3. 将NCMNet的GCI_lay加入DGCNN_Layer中
 但是遇到一个无法与注意力机制进行兼容，太痛了！！！
 这个问题需要解决
+
+后续icml9
 @Evaluation
 baseline：map 68.04
 icml29:map 68.65
@@ -90,7 +91,7 @@ class diff_pool(nn.Module):
     def forward(self, x):
         # 卷积 bcn1
         embed = self.conv(x)  # b*k*n*1
-        print(embed.size())
+        # print(embed.size())
         # 归一化 每个管道的值 bcn
         S = torch.softmax(embed, dim=2).squeeze(3)
         # X x Softmax
@@ -407,6 +408,7 @@ class BCMAttention(nn.Module):
         B, C, N, _ = x.shape
 
         # 1. 提取Q/K/V:
+        # NOTE 这里的压缩的意义不大
         q = self.query_filter(x).squeeze(3)
         k = self.key_filter(x).squeeze(3)
         v = self.value_filter(x).squeeze(3)

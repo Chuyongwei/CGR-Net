@@ -78,9 +78,13 @@ class ResFormer_Block(nn.Module):
         self.relu3 = nn.ReLU()
     def forward(self, x):
         x1 = self.right(x) if self.pre is True else x
+        # TODO 是不是要修改成x？
+        # TAG 信息聚合
         x0 = self.left0(x1)
+        # MLP :CIBR
         out1 = self.left1(x0)
         out1 = self.relu1(out1) + x1
+        # TAG 前馈网络：总是要与前面的信息做交互
         out2 = self.left2(out1)
         out2 = self.relu2(out2) + out1 + x1
         out3 = self.left3(out2)
@@ -92,7 +96,8 @@ def batch_symeig(X):
     b, d, _ = X.size()
     bv = X.new(b,d,d)
     for batch_idx in range(X.shape[0]):
-        e,v = torch.symeig(X[batch_idx,:,:].squeeze(), True)
+        # e,v = torch.symeig(X[batch_idx,:,:].squeeze(), True)
+        e, v = torch.linalg.eigh(X[batch_idx, :, :].squeeze(), UPLO='U')
         bv[batch_idx,:,:] = v
     bv = bv.cuda()
     return bv
@@ -330,9 +335,12 @@ class OANet(nn.Module):
         x2 = self.l2(x_down)  
         x_up = self.up1(x1_1, x2)  
         out = torch.cat([x1_1, x_up], dim=1)
+        # TAG 优化
         out=self.ResFormer(out)
         return out
-
+'''
+动态融合模块
+'''
 class CFS(nn.Module):
     def __init__(self, in_channel,out_channels):
         nn.Module.__init__(self)
@@ -352,19 +360,28 @@ class CFS(nn.Module):
         self.act = nn.ReLU()
 
     def forward(self, x_row, x_local):
-        
-        x_local = self.att1(x_local)  
+
+        # x_row 全局 x_local 局部
+        x_local = self.att1(x_local)
+
         q = self.attq1(x_row)  
         k = self.attk1(x_local)  
-        v = self.attv1(x_local)  
-        att = torch.mul(q, k)  
+        v = self.attv1(x_local)
+
+        # XXX 这里可以考虑 softmax(Q@KT)@V
+        # k/dim**0.5
+        att = torch.mul(q, k)
         att = torch.softmax(att, dim=3)  
         qv = torch.mul(att, v)  
         out_local=torch.cat((x_row,qv),dim=1)
+        # 残差块做一致性优化
         out_local=self.att2(out_local)
-        out = x_row + self.gamma1 * out_local  
+        # 全局+w*局部
+        out = x_row + self.gamma1 * out_local
+        # 降低复杂度
         return (out+out.mean(dim=1,keepdim=True))*0.5
 
+#
 class PAM_Module(nn.Module):
     def __init__(self,out_channels):
         nn.Module.__init__(self)
@@ -375,11 +392,14 @@ class PAM_Module(nn.Module):
         self.gamma1 = nn.Parameter(torch.zeros(1))
 
     def forward(self, x,y):
+        # x 局部
+        # y 全局
         q=self.query(y)
         k=self.key(y)
         energy=torch.mul(q, k)
         attention=self.softmax(energy)
         v = self.value(x)
+        # w*全局 + 局部
         out=self.gamma1 *attention+v
         return out
 
@@ -401,7 +421,9 @@ class CGR_Block(nn.Module):
 
         self.gcn = GCN_Block(self.out_channel)
         self.cluster=250
+        # TAG NCMNet
         self.cfs = CFS(self.out_channel, self.out_channel)
+        # TAG 基于NCMNet编写
         self.pam = PAM_Module(self.out_channel)
         self.RKR = nn.Sequential(
             ResFormer_Block(self.out_channel, self.out_channel, pre=False),
@@ -459,12 +481,22 @@ class CGR_Block(nn.Module):
       
         B, _, N , _ = x.size()
         out = x.transpose(1, 3).contiguous()
-        out = self.conv(out) 
-        out = self.RKR(out)  
-        w0 = self.linear_0(out).view(B, -1) 
-        out_g = self.gcn(out, w0.detach())  
-        out1 = self.cfs(out_g, out) 
+        # 卷积下数据
+        out = self.conv(out)
+
+        # ==== TAG stage1 GSC模块 图分数计算
+        # K邻近卷积
+        out = self.RKR(out)
+        w0 = self.linear_0(out).view(B, -1)
+
+        # ===== TAG stage2 全图上下文 获取全局图分数
+        out_g = self.gcn(out, w0.detach())
+
+        # =====TAG stage3 CGCS 分视图
+        out1 = self.cfs(out_g, out)
+        # k邻近OANet
         out2 = self.gsc(out1)
+        # TAG NCM分三层
         out2=self.pam(out2,out_g)
         w1 = self.linear_1(out2).view(B, -1) 
 

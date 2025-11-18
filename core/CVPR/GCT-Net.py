@@ -73,15 +73,15 @@ class Interation(nn.Module):
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, n1, n2, n3):
-        q1 = self.attq(n1).squeeze(3)
-        k1 = self.attk(n2).squeeze(3)
-        v1 = self.attv(n3).squeeze(3)
-        scores = torch.bmm(q1.transpose(1, 2), k1)
-        att = torch.softmax(scores, dim=2)
-        out = torch.bmm(v1, att.transpose(1, 2))
-        out = out.unsqueeze(3)
-        out = self.conv(out)
-        out = n3 + self.gamma * out
+        q1 = self.attq(n1).squeeze(3) # BCN
+        k1 = self.attk(n2).squeeze(3) # BCK
+        v1 = self.attv(n3).squeeze(3) # BCL
+        scores = torch.bmm(q1.transpose(1, 2), k1) # BNK
+        att = torch.softmax(scores, dim=2) # BNK
+        out = torch.bmm(v1, att.transpose(1, 2)) # BCN
+        out = out.unsqueeze(3) #BCN1
+        out = self.conv(out) # BCN1
+        out = n3 + self.gamma * out #
         return out
 
 def batch_symeig(X):
@@ -200,7 +200,17 @@ def get_graph_feature(x, k=20, idx=None):
     feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous()
     return feature
 
-
+'''
+GCET 主要做了三件事：
+提取两种图上下文：
+out_an（邻域特征，结构信息多，但可能噪声大）
+out_max（max pooling，鲁棒性强，但丢失结构）
+交互建模：
+自注意力 (intra) 保持一致性
+交叉注意力 (inter) 挖掘互补性
+自适应融合 (AFF)：
+得到增强后的上下文表示，既鲁棒又保留结构。
+'''
 
 class GCET(nn.Module): #Graph Context Enhance Transformer
     def __init__(self, knn_num=9, in_channel=128,clusters=256):
@@ -253,34 +263,56 @@ class GCET(nn.Module): #Graph Context Enhance Transformer
         B, _, N, _ = features.shape
         out = get_graph_feature(features, k=self.knn_num)
         out_an = self.conv(out)
-
+        # 1. CGC（Credible Graph Context）
+        # 一号输出
         out_an = self.change1(out_an)
         out_max=self.mlp1(out)
+        # BCN
         out_max = out_max.max(dim=-1,keepdim=False)[0]
         out_max = out_max.unsqueeze(3)
         out_max = self.change2(out_max)
+
+        # (2) Soft assignment 聚类
         embed1 = self.conv_group1(out_an)
         S1 = torch.softmax(embed1, dim=2).squeeze(3)
-        cluster_an = torch.matmul(out_an.squeeze(3), S1.transpose(1, 2)).unsqueeze(3)
+        # CGC的得分，给out
+        cluster_an = torch.matmul(out_an.squeeze(3), S1.transpose(1, 2)).unsqueeze(3) # BCN @ BNC
+        # 批量卷积max然后获得S得分
         embed2 = self.conv_group2(out_max)
         S2 = torch.softmax(embed2, dim=2).squeeze(3)
+        # S2加权到max
         cluster_max = torch.matmul(out_max.squeeze(3), S2.transpose(1, 2)).unsqueeze(3)
+
+        # 3.自注意力+交叉注意力
+        # 内叉
         an_inter=self.inter1(cluster_an,cluster_an,cluster_an)
         max_inter=self.inter2(cluster_max,cluster_max,cluster_max)
+
+        # 交叉
         an_intra=self.intra1(cluster_an,cluster_max,cluster_max)
         max_intra=self.intra2(cluster_max,cluster_an,cluster_an)
+
+        #4 融合
         fusion_an=self.aff1(an_inter,an_intra)
         fusion_max=self.aff2(max_inter,max_intra)
+
+        #5 Cluster-level 融合
         embed3 = self.conv_group3(out_max)
         S3 = torch.softmax(embed3, dim=1).squeeze(3)
+
         out_max = torch.matmul(fusion_an.squeeze(3), S3).unsqueeze(3)
         embed4 = self.conv_group4(out_an)
+
         S4 = torch.softmax(embed4, dim=1).squeeze(3)
         out_an = torch.matmul(fusion_max.squeeze(3), S4).unsqueeze(3)
+        #6 最终融合
         out=self.aff3(out_max,out_an)
         return out
 
 '''
+聚类 (Soft assignment)：把输入 q (GT) 和 v (GS) 投影到 cluster 空间，得到压缩表示；
+引导 (Transformer)：通过 Transformer 用可信 inliers (GS) 引导弱特征 (GT)，增强全局一致性；
+融合 (AFF)：结合 side branch（局部增强）和 transformer 输出（全局引导），再映射回点级别特征。
 
 '''
 class GCGT(nn.Module): #Graph Context Guidance Transformer
@@ -290,6 +322,7 @@ class GCGT(nn.Module): #Graph Context Guidance Transformer
         num_heads = 4
         dropout = None
         activation_fn = 'ReLU'
+        # 多头注意力层，用于 Guidance Source (GS) 引导 Guidance Target (GT)。
         self.transformer = TransformerLayer(in_channels, num_heads, dropout=dropout, activation_fn=activation_fn)
 
         self.conv_group1 = nn.Sequential(
@@ -333,19 +366,33 @@ class GCGT(nn.Module): #Graph Context Guidance Transformer
 
 
     def forward(self, q, v):
+        # (1) Soft assignment 聚类
+        # q,v分别乘加权得分
+        # 最终，torch.matmul 操作会生成新的、压缩过的特征，这些新特征代表了原始特征图中的主要上下文信息或“集群”中心。
         embed1 = self.conv_group1(q)
         S1 = torch.softmax(embed1, dim=2).squeeze(3)
         clustered_q = torch.matmul(q.squeeze(3), S1.transpose(1, 2)).unsqueeze(3)
+
         embed2 = self.conv_group2(v)
         S2 = torch.softmax(embed2, dim=2).squeeze(3)
         clustered_v = torch.matmul(v.squeeze(3), S2.transpose(1, 2)).unsqueeze(3)
+
+
+        # (2) Side branch (残差增强分支)
+        # 根据q做残差计算然后相加
         side= self.conv1(clustered_q)
-        side= side + self.conv2(side)
-        side= self.conv3(side)
-        side= clustered_q + side
+        side= side + self.conv2(side) # BNC1
+        side= self.conv3(side) #BCN1
+        side= clustered_q + side #
+
+        # (3) Transformer 引导
+        # BCN->BNC
+        # 保证弱特征能从强特征里学到信息。使得模块能够捕获不同类型特征之间的依赖关系，从而增强 q 的表示能力。
         feature,att = self.transformer(clustered_q.squeeze(dim=3).transpose(1,2), clustered_v.squeeze(dim=3).transpose(1,2))
+        #
         feature = feature.unsqueeze(dim=-1).transpose(1,2)
         feature = clustered_q + feature
+        # (4) 融合
         fuse=self.aff1(feature,side)
         embed3 = self.conv_group3(q)
         S3 = torch.softmax(embed3, dim=1).squeeze(3)
