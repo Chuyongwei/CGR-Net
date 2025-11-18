@@ -374,7 +374,6 @@ class CFS(nn.Module):
         att = torch.softmax(att, dim=3)  
         qv = torch.mul(att, v)  
         out_local=torch.cat((x_row,qv),dim=1)
-        # 残差块做一致性优化
         out_local=self.att2(out_local)
         # 全局+w*局部
         out = x_row + self.gamma1 * out_local
